@@ -48,6 +48,8 @@ import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from 
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcOutputWriter } from "./rpc-output";
+import { VibeModeController } from "../../vibe/mode-controller";
+import { ToolCatalogController } from "../../vibe/tool-catalog";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -65,6 +67,7 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
+	RpcVibeStateFrame,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -816,6 +819,58 @@ export function registerRpcPersistenceSurface(
 	});
 }
 
+type RpcVibeController = Pick<
+	VibeModeController,
+	"getState" | "enter" | "exit" | "spawn" | "send" | "wait" | "kill" | "list"
+>;
+type RpcVibeCommand = Extract<
+	RpcCommand,
+	{ type: "vibe_status" | "vibe_enter" | "vibe_exit" | "vibe_spawn" | "vibe_send" | "vibe_wait" | "vibe_kill" | "vibe_list" }
+>;
+
+export async function dispatchRpcVibeCommand(
+	controller: RpcVibeController,
+	command: RpcVibeCommand,
+): Promise<object> {
+	switch (command.type) {
+		case "vibe_status":
+			return controller.getState();
+		case "vibe_enter":
+			if (command.prompt !== undefined && (typeof command.prompt !== "string" || !command.prompt.trim())) {
+				throw new Error("prompt must be a non-empty string");
+			}
+			return controller.enter(command.prompt);
+		case "vibe_exit":
+			return controller.exit();
+		case "vibe_spawn":
+			if ((command.cli !== "fast" && command.cli !== "good") || typeof command.prompt !== "string" || !command.prompt.trim()) {
+				throw new Error("cli must be fast or good and prompt must be non-empty");
+			}
+			return controller.spawn(command);
+		case "vibe_send":
+			if (typeof command.session !== "string" || !command.session.trim() || typeof command.message !== "string" || !command.message.trim()) {
+				throw new Error("session and message must be non-empty strings");
+			}
+			return controller.send(command);
+		case "vibe_wait":
+			if (
+				(command.sessions !== undefined &&
+					(!Array.isArray(command.sessions) || command.sessions.some(id => typeof id !== "string" || !id.trim()))) ||
+				(command.timeoutMs !== undefined && (!Number.isFinite(command.timeoutMs) || command.timeoutMs <= 0))
+			) {
+				throw new Error("sessions must contain worker ids and timeoutMs must be positive");
+			}
+			return controller.wait(command);
+		case "vibe_kill":
+			if (typeof command.session !== "string" || !command.session.trim()) {
+				throw new Error("session must be a non-empty worker id");
+			}
+			return controller.kill({ session: command.session });
+		case "vibe_list":
+			return controller.list();
+	}
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -875,6 +930,26 @@ export async function runRpcMode(
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
+	const toolCatalog = new ToolCatalogController(session);
+	const vibeToolSession = session.getToolSession();
+	const vibeController = vibeToolSession
+		? new VibeModeController({
+				session,
+				toolSession: vibeToolSession,
+				subagentEventBus,
+				onState: state => output({ type: "vibe_state", payload: state } satisfies RpcVibeStateFrame),
+				canEnter: () => {
+					if (session.getPlanModeState()?.enabled) return "Exit plan mode first.";
+					if (session.getGoalModeState()?.enabled) return "Exit goal mode first.";
+					return true;
+				},
+				dispatchPrompt: async prompt => (await session.prompt(prompt)) === true,
+			})
+		: undefined;
+	const requireVibeController = (): VibeModeController => {
+		if (!vibeController) throw new Error("Vibe mode is unavailable in this session.");
+		return vibeController;
+	};
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1357,11 +1432,37 @@ export async function runRpcMode(
 				return success(id, "set_todos", { todoPhases: session.getTodoPhases() });
 			}
 
+			case "get_tool_catalog":
+				return success(id, "get_tool_catalog", await toolCatalog.getCatalog());
+
+			case "set_tool_selection": {
+				if (!Array.isArray(command.enabledTools) || command.enabledTools.some(name => typeof name !== "string")) {
+					return error(id, "set_tool_selection", "enabledTools must be an array of tool names", "invalid_payload");
+				}
+				return success(id, "set_tool_selection", await toolCatalog.setSelection(command.enabledTools));
+			}
+
 			case "set_host_tools": {
 				const tools = normalizeHostToolDefinitions(command.tools);
 				const rpcTools = hostToolBridge.setTools(tools);
-				await session.refreshRpcHostTools(rpcTools);
+				await toolCatalog.replaceHostTools(tools, rpcTools);
 				return success(id, "set_host_tools", { toolNames: tools.map(tool => tool.name) });
+			}
+
+			case "vibe_status":
+			case "vibe_enter":
+			case "vibe_exit":
+			case "vibe_spawn":
+			case "vibe_send":
+			case "vibe_wait":
+			case "vibe_kill":
+			case "vibe_list": {
+				try {
+					return success(id, command.type, await dispatchRpcVibeCommand(requireVibeController(), command));
+				} catch (cause) {
+					const message = cause instanceof Error ? cause.message : String(cause);
+					return error(id, command.type, message, message.includes("must") ? "invalid_payload" : undefined);
+				}
 			}
 
 			case "set_host_uri_schemes": {
@@ -1750,6 +1851,7 @@ export async function runRpcMode(
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
 	subagentRegistry?.dispose();
+	vibeController?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle

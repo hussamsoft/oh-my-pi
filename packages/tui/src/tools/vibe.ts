@@ -46,6 +46,12 @@ export interface VibeScreenSnapshot {
 	id: string;
 	cli: VibeCli;
 	state: VibeSessionState;
+	/** Stable display name requested at spawn. */
+	name?: string;
+	/** Worker creation time, retained for canonical state ordering. */
+	createdAt?: number;
+	/** Most recent turn outcome; `idle` until a turn starts. */
+	lastTurnStatus?: "running" | "completed" | "failed" | "cancelled" | "idle";
 	model?: string;
 	turns: number;
 	queued: number;
