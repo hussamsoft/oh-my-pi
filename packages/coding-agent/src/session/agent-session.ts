@@ -800,6 +800,8 @@ export class AgentSession implements SettingsScope {
 	 * undefined to avoid reading the primary's jobs.
 	 */
 	readonly #asyncJobManager: AsyncJobManager | undefined;
+	/** Existing SDK-created tool context used by background Vibe workers. */
+	#toolSession: ToolSession | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
 	/**
@@ -1399,6 +1401,7 @@ export class AgentSession implements SettingsScope {
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
+		this.#toolSession = config.toolSession;
 		this.#extensionRoots =
 			config.extensionRoots ??
 			(() => ({
@@ -6065,6 +6068,11 @@ export class AgentSession implements SettingsScope {
 	/** Current session file path, or undefined if sessions are disabled */
 	get sessionFile(): string | undefined {
 		return this.sessionManager.getSessionFile();
+	}
+
+	/** Existing SDK-created tool context used by background Vibe workers. */
+	getToolSession(): ToolSession | undefined {
+		return this.#toolSession;
 	}
 
 	/** Current session ID */

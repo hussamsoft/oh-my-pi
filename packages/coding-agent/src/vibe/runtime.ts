@@ -112,6 +112,7 @@ interface VibeRestoreCandidate {
 	turnCount: number;
 	lastActivityAt: number;
 	inFlight: boolean;
+	lastTurnStatus: "running" | "completed" | "failed" | "cancelled" | "idle";
 	tombstoneReason?: VibeTombstoneReason;
 }
 
@@ -134,6 +135,7 @@ interface VibeTurn {
 
 interface VibeRecord {
 	id: string;
+	name: string;
 	cli: VibeCli;
 	ownerId: string;
 	parentSessionId: string;
@@ -146,6 +148,7 @@ interface VibeRecord {
 	state: VibeSessionState;
 	createdAt: number;
 	lastActivityAt: number;
+	lastTurnStatus: "running" | "completed" | "failed" | "cancelled" | "idle";
 	/** One-line gist of the latest activity (intent, tool, or result preview). */
 	lastActivity?: string;
 	/** Resolved model display string once known. */
@@ -280,6 +283,7 @@ export class VibeSessionRegistry {
 		this.#records.set(record.id, {
 			id: record.id,
 			cli: record.cli ?? "fast",
+			name: record.id,
 			ownerId: record.ownerId,
 			parentSessionId: "test-parent-session",
 			parentSessionFile: null,
@@ -287,6 +291,7 @@ export class VibeSessionRegistry {
 			state: record.state ?? "running",
 			createdAt: now,
 			lastActivityAt: now,
+			lastTurnStatus: record.jobId ? "running" : "idle",
 			turn: record.jobId
 				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
 				: undefined,
@@ -543,6 +548,9 @@ export class VibeSessionRegistry {
 		records.sort((a, b) => a.createdAt - b.createdAt);
 		return records.map(record => ({
 			id: record.id,
+			name: record.name,
+			createdAt: record.createdAt,
+			lastTurnStatus: record.lastTurnStatus,
 			cli: record.cli,
 			state: record.state,
 			model: record.resolvedModel,
@@ -706,6 +714,7 @@ export class VibeSessionRegistry {
 					turnCount: 0,
 					lastActivityAt: Number.isFinite(eventTime) ? eventTime : event.createdAt,
 					inFlight: false,
+					lastTurnStatus: "idle",
 				});
 				continue;
 			}
@@ -714,10 +723,12 @@ export class VibeSessionRegistry {
 			candidate.lastActivityAt = Number.isFinite(eventTime) ? eventTime : candidate.lastActivityAt;
 			if (event.action === "turn-started" && event.turn >= candidate.turnCount) {
 				candidate.turnCount = event.turn;
+				candidate.lastTurnStatus = "running";
 				candidate.inFlight = true;
 			} else if (event.action === "turn-settled" && event.turn >= candidate.turnCount) {
 				candidate.turnCount = event.turn;
 				candidate.inFlight = false;
+				candidate.lastTurnStatus = event.status ?? "completed";
 			} else if (event.action === "tombstone") {
 				candidate.tombstoneReason = event.reason;
 			} else if (event.action === "tombstone-revoked" && candidate.tombstoneReason === "mode-exit") {
@@ -768,12 +779,14 @@ export class VibeSessionRegistry {
 				parentSessionId: scope.parentSessionId,
 				parentSessionFile: scope.parentSessionFile,
 				childSessionFile,
+				name: spawn.name ?? spawn.id,
 				agent,
 				modelOverride,
 				modelRole,
 				state: "idle",
 				createdAt: spawn.createdAt,
 				lastActivityAt: candidate.lastActivityAt,
+				lastTurnStatus: candidate.inFlight ? "running" : candidate.lastTurnStatus,
 				lastActivity: blockedByCollision
 					? "blocked by an agent id collision"
 					: candidate.inFlight
@@ -823,6 +836,7 @@ export class VibeSessionRegistry {
 		const record: VibeRecord = {
 			id,
 			cli: args.cli,
+			name: requestedName || id,
 			ownerId: scope.ownerId,
 			parentSessionId: scope.parentSessionId,
 			parentSessionFile,
@@ -834,6 +848,7 @@ export class VibeSessionRegistry {
 			createdAt,
 			lastActivityAt: createdAt,
 			queue: [],
+			lastTurnStatus: "idle",
 			turnCount: 0,
 			killed: false,
 			suspended: false,
@@ -853,6 +868,7 @@ export class VibeSessionRegistry {
 						agent: agent.name,
 						childSessionFile: childSessionName,
 						createdAt,
+						name: requestedName || id,
 					},
 					record.parentSessionFile,
 				);
@@ -1356,6 +1372,7 @@ export class VibeSessionRegistry {
 			async ({ jobId: ownJobId, signal }) => {
 				record.state = "running";
 				record.turnCount = turnIndex;
+				record.lastTurnStatus = "running";
 				record.lastActivityAt = Date.now();
 				try {
 					const turnStartedPersisted = await this.#appendLifecycleEvent(
@@ -1386,7 +1403,7 @@ export class VibeSessionRegistry {
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
-					await this.#finishTurn(session, manager, record, ownJobId);
+					await this.#finishTurn(session, manager, record, ownJobId, signal.aborted ? "cancelled" : "failed");
 					const reason = error instanceof Error ? error.message : String(error);
 					record.lastActivity = firstLine(`turn failed: ${reason}`);
 					throw new VibeTurnError(
@@ -1407,10 +1424,12 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManager,
 		record: VibeRecord,
 		settledJobId: string,
+		status: "completed" | "failed" | "cancelled",
 	): Promise<void> {
 		record.lastJobId = settledJobId;
 		record.turn = undefined;
 		record.live = undefined;
+		record.lastTurnStatus = status;
 		record.lastActivityAt = Date.now();
 		if (record.killed || record.suspended) {
 			record.state = "dead";
@@ -1429,6 +1448,7 @@ export class VibeSessionRegistry {
 				...this.#eventBase(record),
 				action: "turn-settled",
 				turn: record.turnCount,
+				status,
 			},
 			record.parentSessionFile,
 		);
@@ -1460,9 +1480,9 @@ export class VibeSessionRegistry {
 		turnIndex: number,
 		result: SingleResult,
 	): Promise<string> {
-		await this.#finishTurn(session, manager, record, settledJobId);
 		const failed = result.exitCode !== 0 || result.aborted === true;
-		const status = result.aborted ? "aborted" : failed ? "failed" : "completed";
+		const status = result.aborted ? "cancelled" : failed ? "failed" : "completed";
+		await this.#finishTurn(session, manager, record, settledJobId, status);
 		record.lastActivity = firstLine(
 			failed
 				? `turn ${turnIndex} ${status}: ${result.abortReason ?? result.error ?? ""}`

@@ -29,11 +29,13 @@ export interface VibeSpawnLifecycleEvent extends VibeLifecycleBase {
 	agent: string;
 	childSessionFile: string;
 	createdAt: number;
+	name?: string;
 }
 
 export interface VibeTurnLifecycleEvent extends VibeLifecycleBase {
 	action: "turn-started" | "turn-settled";
 	turn: number;
+	status?: "completed" | "failed" | "cancelled";
 }
 
 export interface VibeTombstoneLifecycleEvent extends VibeLifecycleBase {
@@ -74,6 +76,7 @@ export function parseLifecycleEvent(value: unknown): VibeLifecycleEvent | undefi
 		const cli = data.cli === "fast" || data.cli === "good" ? data.cli : undefined;
 		if (!cli || typeof data.agent !== "string" || typeof data.childSessionFile !== "string") return undefined;
 		if (typeof data.createdAt !== "number" || !Number.isFinite(data.createdAt)) return undefined;
+		if (data.name !== undefined && typeof data.name !== "string") return undefined;
 		return {
 			...base,
 			action: "spawn",
@@ -81,11 +84,15 @@ export function parseLifecycleEvent(value: unknown): VibeLifecycleEvent | undefi
 			agent: data.agent,
 			childSessionFile: data.childSessionFile,
 			createdAt: data.createdAt,
+			name: data.name,
 		};
 	}
 	if (data.action === "turn-started" || data.action === "turn-settled") {
 		if (typeof data.turn !== "number" || !Number.isInteger(data.turn) || data.turn < 1) return undefined;
-		return { ...base, action: data.action, turn: data.turn };
+		if (data.status !== undefined && data.status !== "completed" && data.status !== "failed" && data.status !== "cancelled") {
+			return undefined;
+		}
+		return { ...base, action: data.action, turn: data.turn, status: data.status };
 	}
 	if (data.action === "tombstone") {
 		const reason = data.reason;

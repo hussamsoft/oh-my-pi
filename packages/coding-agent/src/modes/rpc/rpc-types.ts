@@ -15,6 +15,29 @@ import type { AvailableSlashCommandSource } from "../../slash-commands/available
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import type {
+	VibeEnterResult,
+	VibeExitResult,
+	VibeKillResult,
+	VibeListResult,
+	VibeSendResult,
+	VibeSpawnResult,
+	VibeStateResult,
+	VibeWaitResult,
+} from "../../vibe/mode-controller";
+import type { ToolCatalogEntry } from "../../vibe/tool-catalog";
+
+export type {
+	VibeEnterResult,
+	VibeExitResult,
+	VibeKillResult,
+	VibeListResult,
+	VibeSendResult,
+	VibeSpawnResult,
+	VibeStateResult,
+	VibeWaitResult,
+};
+export type { ToolCatalogEntry };
 import type { RpcMessagesPage } from "./rpc-messages";
 
 // ============================================================================
@@ -47,6 +70,20 @@ export type RpcCommand =
 	| { id?: string; type: "set_event_filter"; events: string[] | null }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
+
+	// Vibe
+	| { id?: string; type: "vibe_status" }
+	| { id?: string; type: "vibe_enter"; prompt?: string }
+	| { id?: string; type: "vibe_exit" }
+	| { id?: string; type: "vibe_spawn"; cli: "fast" | "good"; name?: string; prompt: string }
+	| { id?: string; type: "vibe_send"; session: string; message: string }
+	| { id?: string; type: "vibe_wait"; sessions?: string[]; timeoutMs?: number }
+	| { id?: string; type: "vibe_kill"; session: string }
+	| { id?: string; type: "vibe_list" }
+
+	// Tool catalog
+	| { id?: string; type: "get_tool_catalog" }
+	| { id?: string; type: "set_tool_selection"; enabledTools: string[] }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -319,6 +356,16 @@ export type RpcResponse =
 			success: true;
 			data: RpcSubagentMessagesResult;
 	  }
+	| { id?: string; type: "response"; command: "vibe_status"; success: true; data: VibeStateResult }
+	| { id?: string; type: "response"; command: "vibe_enter"; success: true; data: VibeEnterResult }
+	| { id?: string; type: "response"; command: "vibe_exit"; success: true; data: VibeExitResult }
+	| { id?: string; type: "response"; command: "vibe_spawn"; success: true; data: VibeSpawnResult }
+	| { id?: string; type: "response"; command: "vibe_send"; success: true; data: VibeSendResult }
+	| { id?: string; type: "response"; command: "vibe_wait"; success: true; data: VibeWaitResult }
+	| { id?: string; type: "response"; command: "vibe_kill"; success: true; data: VibeKillResult }
+	| { id?: string; type: "response"; command: "vibe_list"; success: true; data: VibeListResult }
+	| { id?: string; type: "response"; command: "get_tool_catalog"; success: true; data: { tools: ToolCatalogEntry[] } }
+	| { id?: string; type: "response"; command: "set_tool_selection"; success: true; data: { tools: ToolCatalogEntry[] } }
 
 	// Model
 	| {
@@ -452,7 +499,15 @@ export type RpcAgentSessionEventFrame =
 	| Exclude<AgentSessionEvent, { type: RpcMessageEventType }>
 	| RpcMessageEventFrame;
 
-export type RpcSessionEventFrame = RpcAgentSessionEventFrame | RpcSubagentFrame;
+export type RpcSessionEventFrame = RpcAgentSessionEventFrame | RpcSubagentFrame | RpcVibeFrame;
+
+/** Canonical shared-controller state transition. */
+export interface RpcVibeStateFrame {
+	type: "vibe_state";
+	payload: VibeStateResult;
+}
+
+export type RpcVibeFrame = RpcVibeStateFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)

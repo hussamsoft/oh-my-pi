@@ -188,6 +188,8 @@ export interface AgentSessionConfig {
 	getEvalPreludes?: () => readonly EvalPreludeDefinition[];
 	/** Tool bridge context used by user-initiated Python cells to project enabled eval preludes. */
 	evalToolSession?: ToolSession;
+	/** Existing SDK-created tool context used by background Vibe workers. */
+	toolSession?: ToolSession;
 	/** Loaded skills already discovered by the SDK. */
 	skills?: Skill[];
 	/** Frozen routing hints shared with the system prompt and later skillful notices. */

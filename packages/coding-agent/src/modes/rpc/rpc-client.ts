@@ -43,6 +43,15 @@ import type {
 	RpcSubagentProgressFrame,
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
+	ToolCatalogEntry,
+	VibeEnterResult,
+	VibeExitResult,
+	VibeKillResult,
+	VibeListResult,
+	VibeSendResult,
+	VibeSpawnResult,
+	VibeStateResult,
+	VibeWaitResult,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -105,6 +114,7 @@ export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcPromptResultListener = (result: RpcPromptResultFrame) => void;
 export type RpcSessionSettledListener = () => void;
+export type RpcVibeStateListener = (state: VibeStateResult) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -229,6 +239,40 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+function isVibeStateResult(value: unknown): value is VibeStateResult {
+	if (!isRecord(value) || !Number.isInteger(value.revision) || (value.revision as number) < 0 || typeof value.enabled !== "boolean") {
+		return false;
+	}
+	if (!Array.isArray(value.workers)) return false;
+	return value.workers.every(worker => {
+		if (!isRecord(worker)) return false;
+		return (
+			typeof worker.id === "string" &&
+			(worker.cli === "fast" || worker.cli === "good") &&
+			typeof worker.name === "string" &&
+			(worker.state === "initializing" || worker.state === "running" || worker.state === "idle" || worker.state === "dead") &&
+			Number.isInteger(worker.turnCount) &&
+			Number.isInteger(worker.queuedMessages) &&
+			(worker.resolvedModel === undefined || typeof worker.resolvedModel === "string") &&
+			(worker.lastActivity === undefined || typeof worker.lastActivity === "string") &&
+			(worker.currentTool === undefined || typeof worker.currentTool === "string") &&
+			Array.isArray(worker.outputTail) &&
+			worker.outputTail.every(line => typeof line === "string") &&
+			(worker.lastTurnStatus === "running" ||
+				worker.lastTurnStatus === "completed" ||
+				worker.lastTurnStatus === "failed" ||
+				worker.lastTurnStatus === "cancelled" ||
+				worker.lastTurnStatus === "idle") &&
+			typeof worker.createdAt === "number" &&
+			typeof worker.lastActivityAt === "number"
+		);
+	});
+}
+
+function isVibeStateFrame(value: unknown): value is { type: "vibe_state"; payload: VibeStateResult } {
+	return isRecord(value) && value.type === "vibe_state" && isVibeStateResult(value.payload);
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -299,6 +343,7 @@ export class RpcClient {
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
+	#vibeStateListeners = new Set<RpcVibeStateListener>();
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
@@ -606,9 +651,53 @@ export class RpcClient {
 		};
 	}
 
-	/**
-	 * Get collected stderr output (useful for debugging).
-	 */
+	/** Subscribe to canonical shared-controller Vibe state transitions. */
+	onVibeState(listener: RpcVibeStateListener): () => void {
+		this.#vibeStateListeners.add(listener);
+		return () => this.#vibeStateListeners.delete(listener);
+	}
+
+	async getVibeState(): Promise<VibeStateResult> {
+		return this.#getData<VibeStateResult>(await this.#send({ type: "vibe_status" }));
+	}
+
+	async enterVibe(prompt?: string): Promise<VibeEnterResult> {
+		return this.#getData<VibeEnterResult>(await this.#send({ type: "vibe_enter", prompt }));
+	}
+
+	async exitVibe(): Promise<VibeExitResult> {
+		return this.#getData<VibeExitResult>(await this.#send({ type: "vibe_exit" }));
+	}
+
+	async spawnVibeWorker(input: { cli: "fast" | "good"; name?: string; prompt: string }): Promise<VibeSpawnResult> {
+		return this.#getData<VibeSpawnResult>(await this.#send({ type: "vibe_spawn", ...input }));
+	}
+
+	async sendVibeWorker(input: { session: string; message: string }): Promise<VibeSendResult> {
+		return this.#getData<VibeSendResult>(await this.#send({ type: "vibe_send", ...input }));
+	}
+
+	async waitVibeWorkers(input: { sessions?: string[]; timeoutMs?: number }): Promise<VibeWaitResult> {
+		return this.#getData<VibeWaitResult>(await this.#send({ type: "vibe_wait", ...input }));
+	}
+
+	async killVibeWorker(session: string): Promise<VibeKillResult> {
+		return this.#getData<VibeKillResult>(await this.#send({ type: "vibe_kill", session }));
+	}
+
+	async listVibeWorkers(): Promise<VibeListResult> {
+		return this.#getData<VibeListResult>(await this.#send({ type: "vibe_list" }));
+	}
+
+	async getToolCatalog(): Promise<ToolCatalogEntry[]> {
+		return this.#getData<{ tools: ToolCatalogEntry[] }>(await this.#send({ type: "get_tool_catalog" })).tools;
+	}
+
+	async setToolSelection(enabledTools: string[]): Promise<ToolCatalogEntry[]> {
+		return this.#getData<{ tools: ToolCatalogEntry[] }>(await this.#send({ type: "set_tool_selection", enabledTools })).tools;
+	}
+
+	/** Get collected stderr output (useful for debugging). */
 	getStderr(): string {
 		return this.#process?.peekStderr() ?? "";
 	}
@@ -1190,6 +1279,11 @@ export class RpcClient {
 				pending.resolve(data);
 				return;
 			}
+		}
+
+		if (isVibeStateFrame(data)) {
+			for (const listener of this.#vibeStateListeners) listener(data.payload);
+			return;
 		}
 
 		if (isRpcHostToolCallRequest(data)) {
