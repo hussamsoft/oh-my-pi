@@ -858,6 +858,59 @@ export function describeModes(state: OmpModeState, guard: true | string): RpcMod
 }
 
 /**
+ * The transition a `set_mode` asks for, resolved from the current state alone.
+ *
+ * `paused` is a target, not a delta, so a host can name the state it wants
+ * instead of having to know the current one:
+ *
+ *   undefined -> advance the cycle the TUI cycles through: enter, pause, disable
+ *   true      -> paused
+ *   false     -> active
+ *
+ * The no-arg case mirrors `handlePlanModeCommand` on purpose, so a mode badge in
+ * a host and the one in the terminal move together. `paused: false` from a paused
+ * session reactivates rather than disables, because the host asked for the mode,
+ * not for its absence; disabling is what the no-arg cycle step does.
+ */
+export function nextModeTransition(
+	inMode: boolean,
+	paused: boolean,
+	target: boolean | undefined,
+): "enter" | "enter-paused" | "pause" | "disable" | "reactivate" | "none" {
+	if (target === undefined) {
+		if (!inMode) return "enter";
+		return paused ? "disable" : "pause";
+	}
+	if (target) {
+		// Entering straight into the paused state, so a host asking for "paused"
+		// from outside the mode does not leave behind an unpaused turn it never
+		// asked for.
+		if (!inMode) return paused ? "none" : "enter-paused";
+		return paused ? "none" : "pause";
+	}
+	if (!inMode) return "enter";
+	return paused ? "reactivate" : "none";
+}
+
+/**
+ * A paused session is not "enabled". The controller clears `planModeEnabled` on
+ * pause and raises `planModePaused` instead, so "in the mode at all" has to be
+ * the union of the two, or every paused session reads as inactive.
+ */
+function modePresence(controller: OmpModeController, mode: "plan" | "goal") {
+	if (mode === "plan") {
+		return {
+			inMode: controller.planModeEnabled || controller.planModePaused,
+			paused: controller.planModePaused,
+		};
+	}
+	return {
+		inMode: controller.goalModeEnabled || controller.goalModePaused,
+		paused: controller.goalModePaused,
+	};
+}
+
+/**
  * Drives plan, goal and loop mode for the RPC surface.
  *
  * Returns the post-transition state, or `{ conflict }` carrying OMP's own guard
@@ -873,40 +926,37 @@ export async function dispatchRpcModeCommand(
 	if (guard !== true) return { conflict: guard };
 
 	const before = controller.mode;
-	// `paused` selects the transition, it is not merely a target flag:
-	//   undefined -> enter when inactive, no-op when already active
-	//   true      -> pause an active session
-	//   false     -> leave an active session, or re-enter a paused one
-	if (command.mode === "plan") {
-		if (controller.planModeEnabled) {
-			if (command.paused === undefined) return { state: controller.snapshot(), changed: false };
-			const wasPaused = controller.planModePaused;
-			await controller.exitPlan({ paused: command.paused, silent: true });
-			// Re-enter only when the session was paused: un-pausing means "go back
-			// to work", while leaving an active session means "stop". A session
-			// cleared without re-entry would sit half-active with no plan toolset.
-			if (command.paused || !wasPaused) return { state: controller.snapshot(), changed: true };
-			await controller.enterPlan({});
-		} else {
-			await controller.enterPlan({});
-		}
-	} else if (command.mode === "goal") {
-		if (controller.goalModeEnabled) {
-			if (command.paused === undefined) return { state: controller.snapshot(), changed: false };
-			const wasPaused = controller.goalModePaused;
-			await controller.exitGoal({ paused: command.paused, silent: true });
-			if (command.paused || !wasPaused) return { state: controller.snapshot(), changed: true };
-			await controller.enterGoal({});
-		} else {
-			await controller.enterGoal({});
-		}
-	} else if (controller.loopModeEnabled) {
-		controller.disableLoopMode();
-	} else {
-		// Loop mode is session-only: `handleLoopCommand` flips the flag and never
-		// journals, so there is no persisted transition to append here.
-		controller.handleLoopCommand();
+	// Loop mode is session-only: `handleLoopCommand` flips the flag and never
+	// journals, so there is no persisted transition to append here.
+	if (command.mode === "loop") {
+		if (controller.loopModeEnabled) controller.disableLoopMode();
+		else controller.handleLoopCommand();
+		return { state: controller.snapshot(), changed: controller.mode !== before };
 	}
+
+	const { inMode, paused: wasPaused } = modePresence(controller, command.mode);
+	const transition = nextModeTransition(inMode, wasPaused, command.paused);
+	if (transition === "none") return { state: controller.snapshot(), changed: false };
+
+	const exit = async (paused: boolean) => {
+		if (command.mode === "plan") await controller.exitPlan({ paused, silent: true });
+		else await controller.exitGoal({ paused, silent: true });
+	};
+	const enter = async () => {
+		if (command.mode === "plan") await controller.enterPlan({});
+		else await controller.enterGoal({});
+	};
+
+	if (transition === "enter" || transition === "enter-paused" || transition === "reactivate") {
+		// Reactating needs no exit first: pausing already handed the working
+		// toolset and model back, so entering recaptures the same baseline a
+		// fresh entry would and reinstalls the mode's own.
+		await enter();
+		if (transition === "enter-paused") await exit(true);
+	} else {
+		await exit(transition === "pause");
+	}
+
 	return { state: controller.snapshot(), changed: controller.mode !== before };
 }
 

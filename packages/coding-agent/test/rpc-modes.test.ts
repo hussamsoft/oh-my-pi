@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
-import { dispatchRpcModeCommand, toSetModeResponse } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import {
+	dispatchRpcModeCommand,
+	nextModeTransition,
+	toSetModeResponse,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { OmpModeController } from "@oh-my-pi/pi-coding-agent/modes/mode-controller";
 import type { RpcCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 
@@ -70,18 +74,50 @@ function makeController(initialTools: string[] = ["read", "write"]) {
 }
 
 const setMode = (mode: "plan" | "goal" | "loop", paused?: boolean) =>
-	({ type: "set_mode", mode, ...(paused === undefined ? {} : { paused }) }) as Extract<
-		RpcCommand,
-		{ type: "set_mode" }
-	>;
+	({
+		type: "set_mode",
+		mode,
+		...(paused === undefined ? {} : { paused }),
+	}) as Extract<RpcCommand, { type: "set_mode" }>;
+
+/** Unwraps the conflict arm so a blocked transition fails the assertions below it. */
+async function applied(controller: OmpModeController, command: Extract<RpcCommand, { type: "set_mode" }>) {
+	const outcome = await dispatchRpcModeCommand(controller, command);
+	if ("conflict" in outcome) throw new Error(`unexpected conflict: ${outcome.conflict}`);
+	return outcome;
+}
+describe("nextModeTransition", () => {
+	test("a no-arg set_mode walks the same cycle the TUI does", () => {
+		// Outside -> enter, in -> pause, paused -> off. This is the order
+		// handlePlanModeCommand uses, so a host badge and the terminal badge agree.
+		expect(nextModeTransition(false, false, undefined)).toBe("enter");
+		expect(nextModeTransition(true, false, undefined)).toBe("pause");
+		expect(nextModeTransition(true, true, undefined)).toBe("disable");
+	});
+
+	test("an explicit paused target is a state, not a toggle", () => {
+		// `paused: false` on a session already in that state is a no-op. Read as a
+		// delta it would let a host that re-sends its desired state turn the mode
+		// off underneath itself.
+		expect(nextModeTransition(true, false, false)).toBe("none");
+		expect(nextModeTransition(true, true, true)).toBe("none");
+		expect(nextModeTransition(true, false, true)).toBe("pause");
+		expect(nextModeTransition(true, true, false)).toBe("reactivate");
+	});
+
+	test("asking for a paused mode from outside enters straight into it", () => {
+		// Entering and then pausing separately would leave an unpaused turn behind
+		// that the host never asked for.
+		expect(nextModeTransition(false, false, true)).toBe("enter-paused");
+		expect(nextModeTransition(false, false, false)).toBe("enter");
+	});
+});
 
 describe("RPC mode dispatch", () => {
 	test("entering plan installs the plan toolset and reports the new state", async () => {
 		const { controller, appendModeChange } = makeController();
-		const outcome = await dispatchRpcModeCommand(controller, setMode("plan"));
+		const outcome = await applied(controller, setMode("plan"));
 
-		expect("conflict" in outcome).toBe(false);
-		if ("conflict" in outcome) return;
 		expect(outcome.changed).toBe(true);
 		expect(outcome.state.mode).toBe("plan");
 		expect(outcome.state.planModeEnabled).toBe(true);
@@ -90,10 +126,8 @@ describe("RPC mode dispatch", () => {
 
 	test("entering goal reports goal mode without disturbing the plan flags", async () => {
 		const { controller } = makeController();
-		const outcome = await dispatchRpcModeCommand(controller, setMode("goal"));
+		const outcome = await applied(controller, setMode("goal"));
 
-		expect("conflict" in outcome).toBe(false);
-		if ("conflict" in outcome) return;
 		expect(outcome.state.mode).toBe("goal");
 		expect(outcome.state.goalModeEnabled).toBe(true);
 		expect(outcome.state.planModeEnabled).toBe(false);
@@ -101,78 +135,93 @@ describe("RPC mode dispatch", () => {
 
 	test("loop mode is session-only and never journals a mode_change", async () => {
 		const { controller, appendModeChange } = makeController();
-		const outcome = await dispatchRpcModeCommand(controller, setMode("loop"));
+		const outcome = await applied(controller, setMode("loop"));
 
-		expect("conflict" in outcome).toBe(false);
-		if ("conflict" in outcome) return;
 		expect(outcome.state.loopModeEnabled).toBe(true);
 		// Loop never reaches the journal, so a resume starts in `none` regardless.
 		expect(appendModeChange).not.toHaveBeenCalled();
 	});
 
-	test("re-entering the active mode is a no-op rather than a second transition", async () => {
+	test("no-arg set_mode walks plan from inactive through active to paused to off", async () => {
+		const { controller } = makeController();
+
+		expect((await applied(controller, setMode("plan"))).state.mode).toBe("plan");
+		expect((await applied(controller, setMode("plan"))).state.mode).toBe("plan_paused");
+
+		const off = await applied(controller, setMode("plan"));
+		expect(off.state.mode).toBe("none");
+		expect(off.state.planModeEnabled).toBe(false);
+	});
+
+	test("an already-active plan is left alone rather than cycled", async () => {
 		const { controller, appendModeChange } = makeController();
-		await dispatchRpcModeCommand(controller, setMode("plan"));
+		await applied(controller, setMode("plan"));
 		appendModeChange.mockClear();
 
-		const again = await dispatchRpcModeCommand(controller, setMode("plan"));
-		expect("conflict" in again).toBe(false);
-		if ("conflict" in again) return;
+		// `paused: false` names the state the session is already in, so it must
+		// not be read as a request to toggle. Reading it as a delta would let a
+		// host that re-sends its desired state turn the mode off underneath itself.
+		const again = await applied(controller, setMode("plan", false));
 		expect(again.changed).toBe(false);
+		expect(again.state.mode).toBe("plan");
 		expect(appendModeChange).not.toHaveBeenCalled();
 	});
 
-	test("pausing and resuming plan mode round-trips through the journal", async () => {
+	test("disabling plan restores the pre-plan toolset", async () => {
+		const { controller, enabledTools } = makeController(["read"]);
+		await applied(controller, setMode("plan"));
+		// Plan entry re-activates the built-in `write` tool for plan approval.
+		expect(enabledTools()).toContain("write");
+
+		await applied(controller, setMode("plan", true));
+		await applied(controller, setMode("plan"));
+
+		expect(enabledTools()).not.toContain("write");
+	});
+
+	test("reactivating a paused plan reinstalls the plan toolset", async () => {
+		const { controller, enabledTools } = makeController(["read"]);
+		await applied(controller, setMode("plan", true));
+		// Pausing hands the working toolset back, which is the point of pausing.
+		expect(enabledTools()).not.toContain("write");
+
+		await applied(controller, setMode("plan", false));
+
+		// Reactivating has to exit before entering: entering alone would leave the
+		// session holding the plan toolset next to the restored working model.
+		expect(enabledTools()).toContain("write");
+	});
+
+	test("goal mode pauses and reactivates through the same mapping", async () => {
 		const { controller } = makeController();
-		await dispatchRpcModeCommand(controller, setMode("plan"));
+		await applied(controller, setMode("goal"));
 
-		const paused = await dispatchRpcModeCommand(controller, setMode("plan", true));
-		expect("conflict" in paused).toBe(false);
-		if ("conflict" in paused) return;
-		expect(paused.state.mode).toBe("plan_paused");
-		expect(paused.state.planModePaused).toBe(true);
-
-		const resumed = await dispatchRpcModeCommand(controller, setMode("plan", false));
-		expect("conflict" in resumed).toBe(false);
-		if ("conflict" in resumed) return;
-		expect(resumed.state.mode).toBe("plan");
-		expect(resumed.state.planModePaused).toBe(false);
+		expect((await applied(controller, setMode("goal", true))).state.mode).toBe("goal_paused");
+		expect((await applied(controller, setMode("goal", false))).state.mode).toBe("goal");
 	});
 
 	test("returns OMP's own guard message verbatim when a second mode is requested", async () => {
 		const { controller } = makeController();
-		await dispatchRpcModeCommand(controller, setMode("plan"));
+		await applied(controller, setMode("plan"));
 
-		const blocked = await dispatchRpcModeCommand(controller, setMode("goal"));
 		// The exact string the TUI shows, not one composed for the protocol.
-		expect(blocked).toEqual({ conflict: "Exit plan mode first." });
+		expect(await dispatchRpcModeCommand(controller, setMode("goal"))).toEqual({
+			conflict: "Exit plan mode first.",
+		});
 	});
 
 	test("distinguishes a paused plan session from an active one in the guard", async () => {
 		const { controller } = makeController();
-		await dispatchRpcModeCommand(controller, setMode("plan"));
-		await dispatchRpcModeCommand(controller, setMode("plan", true));
+		await applied(controller, setMode("plan", true));
 
-		const blocked = await dispatchRpcModeCommand(controller, setMode("goal"));
-		expect(blocked).toEqual({
+		expect(await dispatchRpcModeCommand(controller, setMode("goal"))).toEqual({
 			conflict: "Plan mode is paused — run /plan again to fully exit.",
 		});
 	});
 
-	test("exiting plan restores the pre-plan toolset", async () => {
-		const { controller, enabledTools } = makeController(["read"]);
-		await dispatchRpcModeCommand(controller, setMode("plan"));
-		// Plan entry re-activates the built-in `write` tool for plan approval.
-		expect(enabledTools()).toContain("write");
-
-		const off = await dispatchRpcModeCommand(controller, setMode("plan", false));
-		expect("conflict" in off).toBe(false);
-		expect(enabledTools()).not.toContain("write");
-	});
-
 	test("maps a blocked transition to a failure carrying OMP's message and mode_conflict", async () => {
 		const { controller } = makeController();
-		await dispatchRpcModeCommand(controller, setMode("plan"));
+		await applied(controller, setMode("plan"));
 
 		const outcome = await dispatchRpcModeCommand(controller, setMode("goal"));
 		const response = toSetModeResponse("req-1", outcome);
@@ -192,8 +241,7 @@ describe("RPC mode dispatch", () => {
 
 	test("maps an applied transition to a success with the post-transition state", async () => {
 		const { controller } = makeController();
-		const outcome = await dispatchRpcModeCommand(controller, setMode("plan"));
-		const response = toSetModeResponse("req-2", outcome);
+		const response = toSetModeResponse("req-2", await dispatchRpcModeCommand(controller, setMode("plan")));
 
 		expect(response).toMatchObject({
 			id: "req-2",

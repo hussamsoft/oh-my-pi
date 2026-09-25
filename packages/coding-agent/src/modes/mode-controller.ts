@@ -272,7 +272,10 @@ export class OmpModeController {
 		deferModelRestore?: boolean;
 		interruptActiveTurn?: boolean;
 	}): Promise<boolean> {
-		if (!this.planModeEnabled) return false;
+		// A paused session still counts as being in the mode: `planModeEnabled` is
+		// already false at that point, so guarding on it alone left no way to turn
+		// a paused plan off, and every caller had to clear the flags by hand.
+		if (!this.planModeEnabled && !this.planModePaused) return false;
 		if (options?.interruptActiveTurn && this.#session.isStreaming) {
 			await this.#session.runModeExitTeardown(async () => {
 				await this.#session.abort?.({ reason: USER_INTERRUPT_LABEL });
