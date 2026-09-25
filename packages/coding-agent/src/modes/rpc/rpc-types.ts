@@ -25,6 +25,7 @@ import type {
 	VibeStateResult,
 	VibeWaitResult,
 } from "../../vibe/mode-controller";
+import type { OmpModeName } from "../mode-controller";
 import type { ToolCatalogEntry } from "../../vibe/tool-catalog";
 
 export type {
@@ -128,7 +129,11 @@ export type RpcCommand =
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| { id?: string; type: "login"; providerId: string }
+
+	// Modes (plan, goal, loop) — driven by the shared OmpModeController
+	| { id?: string; type: "get_modes" }
+	| { id?: string; type: "set_mode"; mode: "plan" | "goal" | "loop"; paused?: boolean };
 
 // ============================================================================
 // RPC State
@@ -228,6 +233,29 @@ export interface RpcOpenSessionResult {
 	resumed: boolean;
 	sessionId: string;
 	sessionFile?: string;
+}
+
+/**
+ * Mode state as the host sees it. `loop` is session-only: it is never journalled,
+ * so a resume always starts in `none` even if a loop was running.
+ */
+export interface RpcModesResult {
+	mode: OmpModeName;
+	planModeEnabled: boolean;
+	planModePaused: boolean;
+	goalModeEnabled: boolean;
+	goalModePaused: boolean;
+	loopModeEnabled: boolean;
+	loopModePaused: boolean;
+	planFilePath: string | undefined;
+	/** False when the requested mode is already active, so no transition ran. */
+	canEnter: true | false;
+	/** Present only when `canEnter` is false: OMP's own guard message, verbatim. */
+	blockedReason: string | undefined;
+}
+
+export interface RpcSetModeResult extends RpcModesResult {
+	changed: boolean;
 }
 
 export interface RpcReadyFrame {
@@ -365,7 +393,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "vibe_kill"; success: true; data: VibeKillResult }
 	| { id?: string; type: "response"; command: "vibe_list"; success: true; data: VibeListResult }
 	| { id?: string; type: "response"; command: "get_tool_catalog"; success: true; data: { tools: ToolCatalogEntry[] } }
-	| { id?: string; type: "response"; command: "set_tool_selection"; success: true; data: { tools: ToolCatalogEntry[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_tool_selection";
+			success: true;
+			data: { tools: ToolCatalogEntry[] };
+	  }
 
 	// Model
 	| {
@@ -459,6 +493,10 @@ export type RpcResponse =
 			data: { providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }> };
 	  }
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
+
+	// Modes
+	| { id?: string; type: "response"; command: "get_modes"; success: true; data: RpcModesResult }
+	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcSetModeResult }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };

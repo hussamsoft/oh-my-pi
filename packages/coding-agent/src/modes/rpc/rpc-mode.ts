@@ -58,7 +58,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
 import { VibeModeController } from "../../vibe/mode-controller";
-import { OmpModeController } from "../mode-controller";
+import { OmpModeController, type OmpModeState } from "../mode-controller";
 import { ToolCatalogController } from "../../vibe/tool-catalog";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
@@ -79,6 +79,7 @@ import type {
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 	RpcVibeStateFrame,
+	RpcModesResult,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -840,6 +841,103 @@ export async function dispatchRpcVibeCommand(controller: RpcVibeController, comm
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
+/** Projects a state snapshot into the RPC result shape, guard included. */
+export function describeModes(state: OmpModeState, guard: true | string): RpcModesResult {
+	return {
+		mode: state.mode,
+		planModeEnabled: state.planModeEnabled,
+		planModePaused: state.planModePaused,
+		goalModeEnabled: state.goalModeEnabled,
+		goalModePaused: state.goalModePaused,
+		loopModeEnabled: state.loopModeEnabled,
+		loopModePaused: state.loopModePaused,
+		planFilePath: state.planFilePath,
+		canEnter: guard === true,
+		blockedReason: guard === true ? undefined : guard,
+	};
+}
+
+/**
+ * Drives plan, goal and loop mode for the RPC surface.
+ *
+ * Returns the post-transition state, or `{ conflict }` carrying OMP's own guard
+ * message. The message is never composed here: it comes from
+ * `OmpModeController.canEnter`, the same source the TUI reads, so a host cannot
+ * drift from what the user sees in the terminal UI.
+ */
+export async function dispatchRpcModeCommand(
+	controller: OmpModeController,
+	command: Extract<RpcCommand, { type: "set_mode" }>,
+): Promise<{ state: OmpModeState; changed: boolean } | { conflict: string }> {
+	const guard = controller.canEnter(command.mode);
+	if (guard !== true) return { conflict: guard };
+
+	const before = controller.mode;
+	// `paused` selects the transition, it is not merely a target flag:
+	//   undefined -> enter when inactive, no-op when already active
+	//   true      -> pause an active session
+	//   false     -> leave an active session, or re-enter a paused one
+	if (command.mode === "plan") {
+		if (controller.planModeEnabled) {
+			if (command.paused === undefined) return { state: controller.snapshot(), changed: false };
+			const wasPaused = controller.planModePaused;
+			await controller.exitPlan({ paused: command.paused, silent: true });
+			// Re-enter only when the session was paused: un-pausing means "go back
+			// to work", while leaving an active session means "stop". A session
+			// cleared without re-entry would sit half-active with no plan toolset.
+			if (command.paused || !wasPaused) return { state: controller.snapshot(), changed: true };
+			await controller.enterPlan({});
+		} else {
+			await controller.enterPlan({});
+		}
+	} else if (command.mode === "goal") {
+		if (controller.goalModeEnabled) {
+			if (command.paused === undefined) return { state: controller.snapshot(), changed: false };
+			const wasPaused = controller.goalModePaused;
+			await controller.exitGoal({ paused: command.paused, silent: true });
+			if (command.paused || !wasPaused) return { state: controller.snapshot(), changed: true };
+			await controller.enterGoal({});
+		} else {
+			await controller.enterGoal({});
+		}
+	} else if (controller.loopModeEnabled) {
+		controller.disableLoopMode();
+	} else {
+		// Loop mode is session-only: `handleLoopCommand` flips the flag and never
+		// journals, so there is no persisted transition to append here.
+		controller.handleLoopCommand();
+	}
+	return { state: controller.snapshot(), changed: controller.mode !== before };
+}
+
+/**
+ * Maps a dispatch outcome onto the wire response. A blocked transition is a
+ * failure carrying OMP's own message and a machine-readable `mode_conflict`
+ * code, so a host can tell "the agent is already in another mode" from a real
+ * error. Exported so that mapping is covered without standing up a session.
+ */
+export function toSetModeResponse(
+	id: string | undefined,
+	outcome: Awaited<ReturnType<typeof dispatchRpcModeCommand>>,
+): RpcResponse {
+	if ("conflict" in outcome) {
+		return {
+			id,
+			type: "response",
+			command: "set_mode",
+			success: false,
+			error: outcome.conflict,
+			code: "mode_conflict",
+		} as RpcResponse;
+	}
+	return {
+		id,
+		type: "response",
+		command: "set_mode",
+		success: true,
+		data: { ...describeModes(outcome.state, true), changed: outcome.changed },
+	} as RpcResponse;
+}
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
 	const { setToolUIContext, headless = false, subagentEventBus, input = claimRpcInput() } = options;
 	// Signal to RPC clients that the server is ready to accept commands
@@ -1823,6 +1921,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return success(id, "login", { providerId: command.providerId });
 				} catch (err: unknown) {
 					return error(id, "login", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "get_modes":
+				return success(id, "get_modes", describeModes(modes.snapshot(), modes.canEnter("plan")));
+
+			case "set_mode": {
+				try {
+					const outcome = await dispatchRpcModeCommand(modes, command);
+					return toSetModeResponse(id, outcome);
+				} catch (err: unknown) {
+					return error(id, "set_mode", err instanceof Error ? err.message : String(err));
 				}
 			}
 
