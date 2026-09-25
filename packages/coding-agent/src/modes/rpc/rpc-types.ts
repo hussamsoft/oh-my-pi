@@ -133,7 +133,19 @@ export type RpcCommand =
 
 	// Modes (plan, goal, loop) — driven by the shared OmpModeController
 	| { id?: string; type: "get_modes" }
-	| { id?: string; type: "set_mode"; mode: "plan" | "goal" | "loop"; paused?: boolean };
+	| { id?: string; type: "set_mode"; mode: "plan" | "goal" | "loop"; paused?: boolean }
+
+	// Keybindings — a host reads the merged table and rebinds one action id
+	| { id?: string; type: "get_keybindings" }
+	| { id?: string; type: "set_keybinding"; keybinding: string; keys: string }
+
+	// Settings — a host reads the full display projection and writes one path
+	| { id?: string; type: "get_settings" }
+	| { id?: string; type: "set_setting"; path: string; value: unknown }
+
+	// Slash commands — a host runs one by name, or gets an overlay descriptor
+	// back for the ones that can only be driven by a terminal UI
+	| { id?: string; type: "run_slash_command"; command: string; args?: string };
 
 // ============================================================================
 // RPC State
@@ -257,6 +269,56 @@ export interface RpcModesResult {
 export interface RpcSetModeResult extends RpcModesResult {
 	changed: boolean;
 }
+
+export interface RpcKeybindingEntry {
+	id: string;
+	keys: string;
+	description?: string;
+	action: string;
+}
+
+export interface RpcKeybindingsResult {
+	keybindings: RpcKeybindingEntry[];
+	/** Where a write lands, or undefined for an in-memory manager. */
+	configPath?: string;
+}
+
+export interface RpcSetKeybindingResult {
+	keybinding: string;
+	keys: string;
+	/** False for an in-memory manager, so a host can label the change session-only. */
+	persisted: boolean;
+	configPath?: string;
+}
+
+export interface RpcSettingEntry {
+	path: string;
+	type: string;
+	defaultValue: unknown;
+	/** Always null for a credential: the value is never sent to a host. */
+	value: unknown;
+	enumValues?: string[];
+	description?: string;
+	credential: boolean;
+	condition?: unknown;
+}
+
+export interface RpcSettingsResult {
+	settings: RpcSettingEntry[];
+	/** Bumped by the store on every effective change, for cheap staleness checks. */
+	revision: number;
+}
+
+export interface RpcSetSettingResult {
+	path: string;
+	value: unknown;
+	revision: number;
+}
+
+export type RpcSlashCommandResult =
+	| { outcome: "consumed"; agentInvoked?: boolean; output: string }
+	| { outcome: "prompt"; prompt: string }
+	| { outcome: "overlay"; overlay: string };
 
 export interface RpcReadyFrame {
 	type: "ready";
@@ -497,6 +559,13 @@ export type RpcResponse =
 	// Modes
 	| { id?: string; type: "response"; command: "get_modes"; success: true; data: RpcModesResult }
 	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcSetModeResult }
+
+	// Keybindings, settings, slash commands
+	| { id?: string; type: "response"; command: "get_keybindings"; success: true; data: RpcKeybindingsResult }
+	| { id?: string; type: "response"; command: "set_keybinding"; success: true; data: RpcSetKeybindingResult }
+	| { id?: string; type: "response"; command: "get_settings"; success: true; data: RpcSettingsResult }
+	| { id?: string; type: "response"; command: "set_setting"; success: true; data: RpcSetSettingResult }
+	| { id?: string; type: "response"; command: "run_slash_command"; success: true; data: RpcSlashCommandResult }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };

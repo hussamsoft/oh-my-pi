@@ -36,6 +36,11 @@ import type { AgentSession } from "../../session/agent-session";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
+import type { SlashCommandRuntime } from "../../slash-commands/types";
+import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import { getRpcKeybindings, setRpcKeybinding } from "./rpc-keybindings";
+import { readRpcSettings, writeRpcSetting } from "./rpc-settings";
+import { runRpcSlashCommand } from "./rpc-slash";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
@@ -1370,6 +1375,39 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	});
 	await emitAvailableCommandsUpdate();
 
+	/**
+	 * The slash runtime, built per call because `output` routes differently: a
+	 * prompt streams command output to the client as it happens, while
+	 * `run_slash_command` collects it into one response. In RPC mode stdout is the
+	 * JSON channel, so neither may write a bare string there.
+	 */
+	const slashRuntime = (emit: (text: string) => void): SlashCommandRuntime => ({
+		session,
+		sessionManager: session.sessionManager,
+		settings: session.settings,
+		cwd: session.sessionManager.getCwd(),
+		output: emit,
+		refreshCommands: emitAvailableCommandsUpdate,
+		reloadPlugins: reloadPluginState,
+		runCommandInBackground: task => shutdownCoordinator.track(task()),
+		notifyTitleChanged: async () => {
+			output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
+		},
+		notifyConfigChanged: async () => {
+			output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+		},
+	});
+
+	/**
+	 * `KeybindingsManager` is only ever constructed by the TUI, so RPC mode has to
+	 * build its own. It is file-backed, so this is lazy: a session that never
+	 * touches a keybinding should not pay for reading keybindings.yml. The global
+	 * `getKeybindings()` is deliberately not used — it lazily builds a TUI-only
+	 * table with no `app.*` entries and no file loaded.
+	 */
+	let keybindingsManager: KeybindingsManager | undefined;
+	const keybindings = (): KeybindingsManager => (keybindingsManager ??= KeybindingsManager.create());
+
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
@@ -1402,22 +1440,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					if (skillResult) {
 						return success(id, "prompt", skillResult);
 					}
-					const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
-						session,
-						sessionManager: session.sessionManager,
-						settings: session.settings,
-						cwd: session.sessionManager.getCwd(),
-						output: text => output({ type: "command_output", text }),
-						refreshCommands: emitAvailableCommandsUpdate,
-						reloadPlugins: reloadPluginState,
-						runCommandInBackground: task => shutdownCoordinator.track(task()),
-						notifyTitleChanged: async () => {
-							output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
-						},
-						notifyConfigChanged: async () => {
-							output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
-						},
-					});
+					const builtinResult = await executeAcpBuiltinSlashCommand(
+						command.message,
+						slashRuntime(text => output({ type: "command_output", text })),
+					);
 					if (builtinResult !== false) {
 						if ("prompt" in builtinResult) {
 							watchAndReportPromptResult({
@@ -1984,6 +2010,43 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				} catch (err: unknown) {
 					return error(id, "set_mode", err instanceof Error ? err.message : String(err));
 				}
+			}
+
+			case "get_keybindings":
+				return success(id, "get_keybindings", getRpcKeybindings(keybindings()));
+
+			case "set_keybinding": {
+				const outcome = setRpcKeybinding(keybindings(), command.keybinding, command.keys);
+				if (outcome.ok) return success(id, "set_keybinding", outcome.result);
+				return error(id, "set_keybinding", outcome.message, outcome.code);
+			}
+
+			case "get_settings":
+				return success(id, "get_settings", readRpcSettings(session.settings));
+
+			case "set_setting": {
+				const outcome = writeRpcSetting(session.settings, command.path, command.value);
+				if (outcome.ok) return success(id, "set_setting", outcome.result);
+				return error(id, "set_setting", outcome.message, outcome.code);
+			}
+
+			case "run_slash_command": {
+				const chunks: string[] = [];
+				const result = await runRpcSlashCommand(
+					command.command,
+					command.args,
+					slashRuntime(text => chunks.push(text)),
+				);
+				if (!result.ok) return error(id, "run_slash_command", result.error, result.code);
+				// `/plan` is a mode toggle, not a surface. A no-arg set_mode is the
+				// same enter/pause/off cycle the TUI runs, so route it there instead
+				// of handing a host an overlay it cannot act on. `/vibe` is left as
+				// an overlay: vibe is entered and exited rather than cycled, so
+				// mapping it here would mean re-implementing its guard.
+				if (result.data.outcome === "overlay" && result.data.overlay === "plan") {
+					return toSetModeResponse(id, await dispatchRpcModeCommand(modes, { type: "set_mode", mode: "plan" }));
+				}
+				return success(id, "run_slash_command", result.data);
 			}
 
 			default: {
