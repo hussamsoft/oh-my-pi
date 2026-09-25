@@ -43,6 +43,7 @@ import { readRpcSettings, writeRpcSetting } from "./rpc-settings";
 import { runRpcSlashCommand } from "./rpc-slash";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { all } from "../../config/registry";
 import type { EventBus } from "../../utils/event-bus";
 import { selectRpcEntries } from "./rpc-compat";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
@@ -85,6 +86,7 @@ import type {
 	RpcSubagentSubscriptionLevel,
 	RpcVibeStateFrame,
 	RpcModesResult,
+	RpcSettingsUpdateFrame,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -1324,6 +1326,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * loss is mirrored on stderr and the exit code is nonzero. A dispose
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
+	let unsubscribeSettings: (() => void) | undefined;
+	let settingsUpdateTimeout: NodeJS.Timeout | null = null;
 	const disposeAndExit = async (): Promise<never> => {
 		try {
 			await session.dispose();
@@ -1355,6 +1359,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
+		unsubscribeSettings?.();
+		if (settingsUpdateTimeout) {
+			clearTimeout(settingsUpdateTimeout);
+			settingsUpdateTimeout = null;
+		}
 		await outputWriter.close();
 		process.exit(0);
 	};
@@ -1374,6 +1383,30 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		void emitAvailableCommandsUpdate();
 	});
 	await emitAvailableCommandsUpdate();
+
+	let pendingSettingsUpdates: string[] = [];
+	const flushSettingsUpdate = () => {
+		if (settingsUpdateTimeout) {
+			clearTimeout(settingsUpdateTimeout);
+			settingsUpdateTimeout = null;
+		}
+		if (pendingSettingsUpdates.length === 0) return;
+		const paths = [...new Set(pendingSettingsUpdates)];
+		pendingSettingsUpdates = [];
+		output({
+			type: "settings_update",
+			payload: {
+				revision: session.settings.revision,
+				paths,
+			},
+		} satisfies RpcSettingsUpdateFrame);
+	};
+	unsubscribeSettings = session.settings.onEffectiveChange(all(), setting => {
+		pendingSettingsUpdates.push(setting.id);
+		if (!settingsUpdateTimeout) {
+			settingsUpdateTimeout = setTimeout(flushSettingsUpdate, 100);
+		}
+	});
 
 	/**
 	 * The slash runtime, built per call because `output` routes differently: a

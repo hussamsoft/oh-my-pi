@@ -606,7 +606,15 @@ export type RpcAgentSessionEventFrame =
 	| Exclude<AgentSessionEvent, { type: RpcMessageEventType }>
 	| RpcMessageEventFrame;
 
-export type RpcSessionEventFrame = RpcAgentSessionEventFrame | RpcSubagentFrame | RpcVibeFrame;
+export interface RpcSettingsUpdateFrame {
+	type: "settings_update";
+	payload: {
+		revision: number;
+		paths: string[];
+	};
+}
+
+export type RpcSessionEventFrame = RpcAgentSessionEventFrame | RpcSubagentFrame | RpcVibeFrame | RpcSettingsUpdateFrame;
 
 /** Canonical shared-controller state transition. */
 export interface RpcVibeStateFrame {

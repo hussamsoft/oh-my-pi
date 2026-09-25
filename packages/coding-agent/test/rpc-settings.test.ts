@@ -175,4 +175,16 @@ describe("writeRpcSetting", () => {
 		expect(lookup("retry.baseDelayMs")?.layered(settings)).toBe(500);
 		expect(row(readRpcSettings(settings).settings, "retry.baseDelayMs").value).toBe(500);
 	});
+
+	test("onEffectiveChange fires when a setting is updated", () => {
+		const settings = Settings.isolated();
+		const changes: string[] = [];
+		const unsubscribe = settings.onEffectiveChange(all(), setting => {
+			changes.push(setting.id);
+		});
+
+		writeRpcSetting(settings, "retry.baseDelayMs", 250);
+		expect(changes).toContain("retry.baseDelayMs");
+		unsubscribe();
+	});
 });
