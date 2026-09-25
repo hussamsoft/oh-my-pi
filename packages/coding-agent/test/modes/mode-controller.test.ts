@@ -125,7 +125,7 @@ describe("OmpModeController", () => {
 		expect(harness.session.abort).toHaveBeenCalledWith({ reason: USER_INTERRUPT_LABEL });
 	});
 
-	it("keeps the goal tool out of the restore set after a guided interview", async () => {
+	it("restores the interview's toolset after an intervening tool mounts", async () => {
 		const harness = makeSession();
 		const controller = makeController(harness.session);
 
@@ -135,11 +135,16 @@ describe("OmpModeController", () => {
 		controller.recordGoalToolBaseline();
 		harness.setEnabledTools(["read", "write", "goal"]);
 
+		// An MCP tool can mount between the interview and the tool-driven create.
+		// Exit must restore the set captured at interview time, not a fresh read
+		// that now also contains the new tool. The `goal` filter alone cannot catch
+		// this, which is why the baseline is adopted rather than overwritten.
+		harness.setEnabledTools(["read", "write", "goal", "mcp-foo"]);
+
 		await controller.enterGoal({ objective: "ship it" });
 		await controller.exitGoal();
 
-		// Entering goal re-reads a toolset that already contains `goal`; if it
-		// overwrote the baseline the goal tool would survive the exit.
+		expect(harness.session.setActiveToolsByName).toHaveBeenLastCalledWith(["read", "write"]);
 		expect(harness.session.getEnabledToolNames()).not.toContain("goal");
 	});
 
