@@ -477,6 +477,8 @@ function loadMergedKeybindingsConfig(
 	options: KeybindingsCreateOptions,
 ): {
 	config: KeybindingsConfig;
+	/** The profile layer alone, for writes that must not absorb inherited keys. */
+	profileConfig: KeybindingsConfig;
 	profilePath: string;
 	inheritedPath: string | undefined;
 } {
@@ -484,7 +486,12 @@ function loadMergedKeybindingsConfig(
 	const profile = loadKeybindingsConfig(profilePaths.readPath, profilePaths.writeBackPath);
 	const inheritedAgentDir = resolveInheritedAgentDir(agentDir, options);
 	if (!inheritedAgentDir) {
-		return { config: profile.config, profilePath: profile.persistedPath, inheritedPath: undefined };
+		return {
+			config: profile.config,
+			profileConfig: profile.config,
+			profilePath: profile.persistedPath,
+			inheritedPath: undefined,
+		};
 	}
 
 	const inheritedPaths = resolveKeybindingsConfigPaths(inheritedAgentDir);
@@ -494,6 +501,7 @@ function loadMergedKeybindingsConfig(
 	const inherited = loadKeybindingsConfig(inheritedPaths.readPath, undefined);
 	return {
 		config: mergeKeybindingsConfig(inherited.config, profile.config),
+		profileConfig: profile.config,
 		profilePath: profile.persistedPath,
 		inheritedPath: inherited.persistedPath,
 	};
@@ -579,13 +587,27 @@ function keyConfigValue(keys: KeyId[]): KeyId | KeyId[] {
 export class KeybindingsManager extends TuiKeybindingsManager {
 	#configPath: string | undefined;
 	#inheritedConfigPath: string | undefined;
+	/** Merged (inherited + profile) bindings, used for reads. */
 	#userBindings: KeybindingsConfig;
+	/**
+	 * The profile layer alone. A write must persist this, not the merged set:
+	 * materialising inherited keys into a named profile's own file would pin
+	 * every parent binding as a child override, so unsetting one in the parent
+	 * would stop taking effect.
+	 */
+	#profileBindings: KeybindingsConfig;
 
-	constructor(userBindings: KeybindingsConfig = {}, configPath?: string, inheritedConfigPath?: string) {
+	constructor(
+		userBindings: KeybindingsConfig = {},
+		configPath?: string,
+		inheritedConfigPath?: string,
+		profileBindings?: KeybindingsConfig,
+	) {
 		super(KEYBINDINGS, userBindings);
 		this.#configPath = configPath;
 		this.#inheritedConfigPath = inheritedConfigPath;
 		this.#userBindings = userBindings;
+		this.#profileBindings = profileBindings ?? userBindings;
 	}
 
 	/**
@@ -593,8 +615,13 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	 * Legacy keybindings.json is migrated to keybindings.yml on load.
 	 */
 	static create(agentDir: string = getAgentDir(), options: KeybindingsCreateOptions = {}): KeybindingsManager {
-		const { config: userBindings, profilePath, inheritedPath } = loadMergedKeybindingsConfig(agentDir, options);
-		const manager = new KeybindingsManager(userBindings, profilePath, inheritedPath);
+		const {
+			config: userBindings,
+			profileConfig,
+			profilePath,
+			inheritedPath,
+		} = loadMergedKeybindingsConfig(agentDir, options);
+		const manager = new KeybindingsManager(userBindings, profilePath, inheritedPath, profileConfig);
 		// Set globally so getKeybindings() returns this manager
 		setKeybindings(manager);
 		return manager;
@@ -616,6 +643,9 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 			? KeybindingsManager.#loadFromFile(this.#inheritedConfigPath)
 			: { config: {} };
 		const { config: profileConfig } = KeybindingsManager.#loadFromFile(this.#configPath);
+		// Refresh the profile layer too, so the next write persists what is on disk
+		// rather than the layer captured at construction.
+		this.#profileBindings = profileConfig;
 		this.setUserBindings(mergeKeybindingsConfig(inheritedConfig, profileConfig));
 	}
 
@@ -643,6 +673,38 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	 */
 	getEffectiveConfig(): KeybindingsConfig {
 		return this.getResolvedBindings();
+	}
+
+	/**
+	 * Rebinds one action id and persists it to the config file that already wins
+	 * the merge, so the write is never shadowed by the inherited layer on the next
+	 * load. Returns `persisted: false` for an in-memory manager: that one has no
+	 * file, so the change is session-only and the caller must say so.
+	 *
+	 * The caller must validate `keys` with `parseKey` first. Writing an unparseable
+	 * binding would persist something that then fails to load on the next start.
+	 */
+	setKeybinding(keybinding: Keybinding, keys: KeyId | KeyId[]): { persisted: boolean; path: string | undefined } {
+		const value = Array.isArray(keys) ? [...keys] : keys;
+		this.#userBindings = { ...this.#userBindings, [keybinding]: value };
+		super.setUserBindings(this.#userBindings);
+		if (!this.#configPath) {
+			return { persisted: false, path: undefined };
+		}
+		// Write the profile layer, not the merged set. Materialising inherited
+		// keys into a named profile's own file would pin every parent binding as a
+		// child override, so a later change in the parent would stop taking effect.
+		this.#profileBindings = { ...this.#profileBindings, [keybinding]: value };
+		const persisted = writeKeybindingsConfig(this.#configPath, orderKeybindingsConfig(this.#profileBindings));
+		if (persisted) {
+			logger.info("Persisted keybinding change", { path: this.#configPath, keybinding });
+		}
+		return { persisted, path: this.#configPath };
+	}
+
+	/** The file this manager writes to, or undefined when it is in-memory only. */
+	getConfigPath(): string | undefined {
+		return this.#configPath;
 	}
 
 	/**
