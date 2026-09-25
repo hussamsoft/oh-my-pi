@@ -117,7 +117,6 @@ import {
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
-import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkTargets } from "../internal-urls/hyperlink-targets";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { modelMentionChipLabel } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
@@ -192,6 +191,7 @@ import {
 } from "../utils/title-generator";
 import { aggregateVibeWorkerTokensPerSecond } from "../vibe/runtime";
 import { VibeModeController } from "../vibe/mode-controller";
+import { OmpModeController } from "./mode-controller";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
@@ -241,15 +241,11 @@ import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TanCommandController } from "./controllers/tan-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
 import { imageReferenceHyperlink, materializeImageReferenceLinks } from "@oh-my-pi/pi-tui/prompt/image-references";
-import { describeLoopCondition, evaluateLoopCondition, type LoopConditionVerdict } from "./loop-condition";
+import { evaluateLoopCondition, type LoopConditionVerdict } from "./loop-condition";
 import {
 	consumeLoopLimitIteration,
-	createLoopLimitRuntime,
-	describeLoopLimit,
-	describeLoopLimitRuntime,
 	isLoopDurationExpired,
 	isLoopLimitExhausted,
-	parseLoopArgs,
 } from "./loop-limit";
 import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
 import { OAuthManualInputManager } from "./oauth-manual-input";
@@ -964,17 +960,74 @@ export class InteractiveMode implements InteractiveModeContext {
 	toolOutputExpanded = false;
 	hideToolActivity = false;
 	todoExpanded = false;
-	planModeEnabled = false;
-	planModePaused = false;
-	goalModeEnabled = false;
-	goalModePaused = false;
+	readonly #modes: OmpModeController;
 	readonly #vibeController: VibeModeController;
-	planModePlanFilePath: string | undefined = undefined;
-	loopModeEnabled = false;
-	loopModePaused = false;
-	loopPrompt: string | undefined = undefined;
-	loopLimit: LoopLimitRuntime | undefined = undefined;
-	loopCondition: LoopConditionConfig | undefined = undefined;
+	/**
+	 * Mode state lives in {@link OmpModeController} so the TUI and an RPC host
+	 * share one transition path and one guard. These accessors keep the existing
+	 * `InteractiveModeContext` contract intact for the input controller and the
+	 * debug surface.
+	 */
+	get planModeEnabled(): boolean {
+		return this.#modes.planModeEnabled;
+	}
+	set planModeEnabled(value: boolean) {
+		this.#modes.planModeEnabled = value;
+	}
+	get planModePaused(): boolean {
+		return this.#modes.planModePaused;
+	}
+	set planModePaused(value: boolean) {
+		this.#modes.planModePaused = value;
+	}
+	get goalModeEnabled(): boolean {
+		return this.#modes.goalModeEnabled;
+	}
+	set goalModeEnabled(value: boolean) {
+		this.#modes.goalModeEnabled = value;
+	}
+	get goalModePaused(): boolean {
+		return this.#modes.goalModePaused;
+	}
+	set goalModePaused(value: boolean) {
+		this.#modes.goalModePaused = value;
+	}
+	get planModePlanFilePath(): string | undefined {
+		return this.#modes.planModePlanFilePath;
+	}
+	set planModePlanFilePath(value: string | undefined) {
+		this.#modes.planModePlanFilePath = value;
+	}
+	get loopModeEnabled(): boolean {
+		return this.#modes.loopModeEnabled;
+	}
+	set loopModeEnabled(value: boolean) {
+		this.#modes.loopModeEnabled = value;
+	}
+	get loopModePaused(): boolean {
+		return this.#modes.loopModePaused;
+	}
+	set loopModePaused(value: boolean) {
+		this.#modes.loopModePaused = value;
+	}
+	get loopPrompt(): string | undefined {
+		return this.#modes.loopPrompt;
+	}
+	set loopPrompt(value: string | undefined) {
+		this.#modes.loopPrompt = value;
+	}
+	get loopLimit(): LoopLimitRuntime | undefined {
+		return this.#modes.loopLimit;
+	}
+	set loopLimit(value: LoopLimitRuntime | undefined) {
+		this.#modes.loopLimit = value;
+	}
+	get loopCondition(): LoopConditionConfig | undefined {
+		return this.#modes.loopCondition;
+	}
+	set loopCondition(value: LoopConditionConfig | undefined) {
+		this.#modes.loopCondition = value;
+	}
 	/**
 	 * Aborts the in-flight `--while` / `--until` evaluation. Esc between
 	 * iterations lands while the condition command is still running, and
@@ -1155,8 +1208,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
 	#headerAfter: readonly Component[] = [];
-	#planModePreviousToolPresentation: { enabled: string[]; mounted: string[] } | undefined;
-	#goalModePreviousTools: string[] | undefined;
 	// FIFO tail + live count for concurrent /vibe skill dispatches. A skill
 	// prompt yields on its file read before the turn reserves, so each skill
 	// links behind its predecessor (arrival order) while the count — visible
@@ -1175,7 +1226,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
 	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
 	#pendingPlanModelSwitch = false;
-	#planModeHasEntered = false;
 	#planReviewOverlay: PlanReviewOverlay | undefined;
 	#planReviewOverlayHandle: OverlayHandle | undefined;
 	#sessionInfoOverlayHandle: OverlayHandle | undefined;
@@ -1524,18 +1574,43 @@ export class InteractiveMode implements InteractiveModeContext {
 			getActiveModelString: () => (session.model ? formatModelString(session.model) : undefined),
 			asyncJobManager: session.asyncJobManager,
 		};
+		this.#modes = new OmpModeController({
+			session,
+			isVibeEnabled: () => this.#vibeController.isEnabled,
+			resolvePlanFilePath: () => this.#getPlanFilePath(),
+			applyPlanModeModel: () => this.#applyPlanModeModel(),
+			restorePlanPreviousModel: previous => this.#restorePlanPreviousModel(previous),
+			planPreviousModelState: () => this.#planModePreviousModelState,
+			capturePlanModelState: () =>
+				this.session.model
+					? { model: this.session.model, thinkingLevel: this.session.configuredThinkingLevel() }
+					: undefined,
+			clearPendingPlanModelSwitch: () => this.#clearPendingPlanModelSwitch(),
+			invalidatePromptCache: () => {
+				this.lastAssistantUsage = undefined;
+			},
+			onStatus: message => this.showStatus(message),
+			onWarning: message => this.showWarning(message),
+			onError: message => this.showError(message),
+			onModeChanged: () => {
+				this.#updatePlanModeStatus();
+				this.#updateGoalModeStatus();
+				this.#syncLoopModeStatus();
+			},
+			cancelLoopAutoSubmit: () => this.#cancelLoopAutoSubmit(),
+			abortLoopCondition: () => this.#abortLoopCondition(),
+			resetGoalContinuation: () => {
+				this.#pendingGoalContinuationTurns = 0;
+				this.#resetGoalContinuationSuppression();
+				this.#cancelGoalContinuation();
+			},
+		});
 		this.#vibeController = new VibeModeController({
 			session,
 			toolSession,
 			eventBus,
 			subagentEventBus,
-			canEnter: () => {
-				if (this.planModeEnabled || this.planModePaused) {
-					return this.planModePaused ? "Plan mode is paused — run /plan again to fully exit." : "Exit plan mode first.";
-				}
-				if (this.goalModeEnabled || this.goalModePaused) return "Exit goal mode first.";
-				return true;
-			},
+			canEnter: () => this.#modes.canEnter("vibe"),
 			onBlocked: message => this.showWarning(message),
 			dispatchPrompt: prompt => this.#dispatchVibePrompt(prompt),
 			onEntered: () => {
@@ -2597,31 +2672,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	disableLoopMode(message = "Loop mode disabled."): void {
-		const wasEnabled = this.loopModeEnabled;
-		this.loopModeEnabled = false;
-		this.loopModePaused = false;
-		this.loopPrompt = undefined;
-		this.loopLimit = undefined;
-		this.loopCondition = undefined;
-		this.#cancelLoopAutoSubmit();
-		this.#abortLoopCondition();
-		this.#syncLoopModeStatus();
-		if (wasEnabled) {
-			this.showStatus(message);
-		}
+		this.#modes.disableLoopMode(message);
 	}
 
 	setLoopPrompt(prompt: string): void {
-		if (!this.loopModeEnabled) return;
-		// Any manual submit supersedes whatever gate is currently pending, even
-		// one resubmitting identical text: the gate was checking the *previous*
-		// iteration, and that iteration's turn is about to be superseded either
-		// way. Abort immediately instead of letting it run for up to the
-		// configured timeout in parallel with the turn it can no longer gate.
-		this.#abortLoopCondition();
-		this.loopPrompt = prompt;
-		this.loopModePaused = false;
-		this.#syncLoopModeStatus();
+		this.#modes.setLoopPrompt(prompt);
+	}
+
+	pauseLoop(): void {
+		this.#modes.pauseLoop();
 	}
 
 	/**
@@ -2634,49 +2693,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#scheduleLoopAutoSubmit();
 	}
 
-	/**
-	 * Pause the loop without exiting it: drops the captured prompt and any
-	 * pending auto-resubmit. Loop mode stays enabled — the next prompt the
-	 * user submits becomes the new loop prompt and resumes iteration.
-	 */
-	pauseLoop(): void {
-		this.loopPrompt = undefined;
-		this.loopModePaused = true;
-		this.#cancelLoopAutoSubmit();
-		this.#abortLoopCondition();
-		this.#syncLoopModeStatus();
-	}
-
 	async handleLoopCommand(args = ""): Promise<string | undefined> {
-		if (this.loopModeEnabled) {
-			this.disableLoopMode();
-			return undefined;
-		}
-		const parsed = parseLoopArgs(args);
-		if (typeof parsed === "string") {
-			this.showError(parsed);
-			return undefined;
-		}
-		this.loopModeEnabled = true;
-		this.loopModePaused = false;
-		this.loopPrompt = undefined;
-		this.loopLimit = createLoopLimitRuntime(parsed.limit);
-		this.loopCondition = parsed.condition;
-		this.#syncLoopModeStatus();
-		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
-		// The condition is a *continuation* signal: the first iteration always
-		// runs, and it is re-evaluated before each subsequent one.
-		const conditionSuffix = parsed.condition ? ` Continuing ${describeLoopCondition(parsed.condition)}.` : "";
-		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
-		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix}${conditionSuffix} ${tail} Esc suspends the ongoing loop; /loop again to disable.`,
-		);
-		// Hand any inline prompt back to the dispatcher so the normal submit flow
-		// runs the first iteration — it records the text as the loop prompt and
-		// auto-resubmits it after each yield, identical to typing the prompt right
-		// after enabling loop mode.
-		return parsed.prompt;
+		return this.#modes.handleLoopCommand(args);
 	}
 
 	recordLocalSubmission(text: string, imageCount = 0): () => void {
@@ -4083,44 +4101,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #clearTransientModeState(): Promise<void> {
-		if (this.planModeEnabled || this.planModePaused) {
-			this.session.setPlanModeState(undefined);
-			try {
-				const previousPresentation = this.#planModePreviousToolPresentation;
-				if (previousPresentation) {
-					await this.session.restoreNonMCPToolPresentation(
-						previousPresentation.enabled,
-						previousPresentation.mounted,
-					);
-				}
-			} finally {
-				this.session.setPlanProposalHandler?.(null);
-				this.planModeEnabled = false;
-				this.planModePaused = false;
-				this.planModePlanFilePath = undefined;
-				this.#planModePreviousToolPresentation = undefined;
-				this.#planModePreviousModelState = undefined;
-				this.#pendingModelSwitch = undefined;
-				this.#pendingPlanModelSwitch = false;
-				this.#planModeHasEntered = false;
-				this.#updatePlanModeStatus();
-			}
-		}
-
-		if (this.goalModeEnabled || this.goalModePaused) {
-			if (this.#goalModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#goalModePreviousTools);
-			}
-			this.session.setGoalModeState(undefined);
-			this.goalModeEnabled = false;
-			this.goalModePaused = false;
-			this.#goalModePreviousTools = undefined;
-			this.#pendingGoalContinuationTurns = 0;
-			this.#previousGoalContinuationActivity = undefined;
-			this.#goalSuppressNextContinuation = false;
-			this.#cancelGoalContinuation();
-			this.#updateGoalModeStatus();
-		}
+		await this.#modes.clearTransientState();
+		this.#planModePreviousModelState = undefined;
+		this.#pendingModelSwitch = undefined;
+		this.#pendingPlanModelSwitch = false;
+		this.#pendingGoalContinuationTurns = 0;
+		this.#previousGoalContinuationActivity = undefined;
+		this.#goalSuppressNextContinuation = false;
+		this.#cancelGoalContinuation();
 	}
 
 	/** Reconcile mode state from session entries on resume/switch. */
@@ -4142,24 +4130,19 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.sessionManager.appendModeChange("none");
 				return;
 			}
-			this.session.setGoalModeState({
-				enabled: sessionContext.mode === "goal",
-				mode: "active",
-				goal,
-			});
 			const restored = await this.session.goalRuntime.onThreadResumed({
 				preserveActiveGoal: options?.preserveActiveGoal,
 			});
-			this.goalModeEnabled = restored?.enabled === true;
-			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
+			this.#modes.adoptGoalState(
+				restored?.enabled === true,
+				restored?.enabled !== true && restored?.goal.status === "paused",
+				{ enabled: sessionContext.mode === "goal", mode: "active", goal },
+			);
 			// sdk.ts excludes "goal" from the initial active tool set unconditionally.
 			// Re-add it now so the agent can call resume, complete, or drop on this goal.
 			if (restored?.goal) {
-				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
-				this.#goalModePreviousTools = previousTools;
-				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
+				await this.#modes.rearmGoalTool();
 			}
-			this.#updateGoalModeStatus();
 			return;
 		}
 		this.session.goalRuntime.clearAccounting();
@@ -4176,9 +4159,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const planFilePath = sessionContext.modeData?.planFilePath as string | undefined;
 			await this.#enterPlanMode({ planFilePath, preserveRestoredModel: true });
 		} else if (sessionContext.mode === "plan_paused") {
-			this.planModePaused = true;
-			this.#planModeHasEntered = true;
-			this.#updatePlanModeStatus();
+			this.#modes.adoptPausedPlan();
 		}
 	}
 
@@ -4187,80 +4168,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		workflow?: "parallel" | "iterative";
 		preserveRestoredModel?: boolean;
 	}): Promise<void> {
-		if (this.planModeEnabled) {
-			return;
-		}
-		if (this.goalModeEnabled || this.goalModePaused) {
-			this.showWarning("Exit goal mode first.");
-			return;
-		}
-		if (this.vibeModeEnabled) {
-			this.showWarning("Exit vibe mode first.");
-			return;
-		}
-
-		this.planModePaused = false;
-
-		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
-		const previousTools = this.session.getEnabledToolNames();
-		const previousMountedTools = this.session.getMountedXdevToolNames();
-		// `plan-mode-active.md` instructs the agent to draft the plan file with
-		// `write` and refine it with `edit`, and plan approval itself is a `write`
-		// to `xd://propose`. Both must be in the active set or the agent falls
-		// back to `edit` on a non-existent file and stalls — and cannot submit the plan.
-		// `edit` is an essential built-in and always ships top-level; re-activate
-		// `write` here only when the current registry entry is the built-in write
-		// tool (issue #3165). A shadowing extension tool named `write` must stay
-		// inactive because plan mode's read-only guarantee relies on the built-in
-		// write/edit guard. The standing handler below consumes plan-approval
-		// dispatches.
-		const planAugmentations: string[] = [];
-		if (this.session.hasBuiltInTool("write")) {
-			planAugmentations.push("write");
-		}
-		const uniquePlanTools = [...new Set([...previousTools, ...planAugmentations])];
-
-		this.#planModePreviousToolPresentation = {
-			enabled: previousTools.filter(name => !isMCPToolName(name)),
-			mounted: previousMountedTools.filter(name => !isMCPToolName(name)),
-		};
-		this.planModePlanFilePath = planFilePath;
-		this.planModeEnabled = true;
-		// Suppress cache-miss marker on the next turn: plan mode changes the system
-		// prompt, which predictably invalidates the cache.
-		this.lastAssistantUsage = undefined;
-
-		// Plan mode state must land before the tool partition: under Code Mode the
-		// direct surface keeps `write` only while a transport needs it, and plan
-		// approval is a top-level `write` to `xd://propose`.
-		const previousPlanModeState = this.session.getPlanModeState();
-		this.session.setPlanModeState({
-			enabled: true,
-			planFilePath,
-			workflow: options?.workflow ?? "parallel",
-			reentry: this.#planModeHasEntered,
-		});
-		try {
-			await this.session.setActiveToolsByName(uniquePlanTools);
-		} catch (error) {
-			this.session.setPlanModeState(previousPlanModeState);
-			this.planModeEnabled = false;
-			throw error;
-		}
-		this.session.setPlanProposalHandler?.(title => this.session.preparePlanForReview(title));
-		if (this.session.isStreaming) {
-			await this.session.sendPlanModeContext({ deliverAs: "steer" });
-		}
-		this.#planModeHasEntered = true;
-		// Session loading already restored the model recorded in the journal.
-		// Reapplying today's plan role here would replace a CLI/session-specific
-		// selection with current config during --resume or an in-process switch.
-		if (!options?.preserveRestoredModel) {
-			await this.#applyPlanModeModel();
-		}
-		this.#updatePlanModeStatus();
-		this.sessionManager.appendModeChange("plan", { planFilePath });
-		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+		await this.#modes.enterPlan(options ?? {});
 	}
 
 	async #restorePlanPreviousModel(prev: { model: Model; thinkingLevel?: ConfiguredThinkingLevel }): Promise<void> {
@@ -4306,105 +4214,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		deferModelRestore?: boolean;
 		interruptActiveTurn?: boolean;
 	}): Promise<void> {
-		if (!this.planModeEnabled) {
-			return;
-		}
-		// A mid-turn exit must interrupt the currently streaming turn.
-		// The plan-mode prompt instructs the model to keep planning until it
-		// writes to `xd://propose`, so the live turn must be aborted inside
-		// `runModeExitTeardown` to avoid restarting on the stale toolset.
-		if (options?.interruptActiveTurn && this.session.isStreaming) {
-			await this.session.runModeExitTeardown(async () => {
-				await this.session.abort({ reason: USER_INTERRUPT_LABEL });
-				await this.#tearDownPlanMode(options);
-			});
-			return;
-		}
-		await this.#tearDownPlanMode(options);
-	}
-
-	async #tearDownPlanMode(options?: {
-		silent?: boolean;
-		paused?: boolean;
-		deferModelRestore?: boolean;
-	}): Promise<void> {
-		const planModeState = this.session.getPlanModeState();
-		const planModeTools = this.session.getEnabledToolNames();
-		const planModeMountedTools = this.session.getMountedXdevToolNames();
-		const planModeModelState = this.session.model
-			? {
-					model: this.session.model,
-					thinkingLevel: this.session.configuredThinkingLevel(),
-				}
-			: undefined;
-		this.session.setPlanModeState(undefined);
-		try {
-			const previousPresentation = this.#planModePreviousToolPresentation;
-			if (previousPresentation) {
-				await this.session.restoreNonMCPToolPresentation(
-					previousPresentation.enabled,
-					previousPresentation.mounted,
-				);
-			}
-			if (this.#planModePreviousModelState && !options?.deferModelRestore) {
-				await this.#restorePlanPreviousModel(this.#planModePreviousModelState);
-			}
-			// If #applyPlanModeModel queued a deferred switch to the plan-role model
-			// (because the session was streaming on entry), drop it now: we are
-			// leaving plan mode, so flushing it on the next agent_end would land the
-			// session on the plan-role model after the user has exited plan mode
-			// (issue #816). This runs even when deferModelRestore is set
-			// (compact-approval path): otherwise the stale plan switch survives and
-			// flushPendingModelSwitch() later clobbers the restored/execution model.
-			if (this.#planModePreviousModelState) this.#clearPendingPlanModelSwitch();
-		} catch (error) {
-			this.session.setPlanModeState(planModeState);
-			if (
-				planModeModelState &&
-				(!modelsAreEqual(this.session.model, planModeModelState.model) ||
-					this.session.configuredThinkingLevel() !== planModeModelState.thinkingLevel)
-			) {
-				try {
-					await this.#restorePlanPreviousModel(planModeModelState);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan model after plan exit failure", {
-						error: String(rollbackError),
-					});
-				}
-			}
-			const enabledTools = this.session.getEnabledToolNames();
-			const mountedTools = this.session.getMountedXdevToolNames();
-			if (
-				enabledTools.length !== planModeTools.length ||
-				enabledTools.some((name, index) => name !== planModeTools[index]) ||
-				mountedTools.length !== planModeMountedTools.length ||
-				mountedTools.some((name, index) => name !== planModeMountedTools[index])
-			) {
-				try {
-					await this.session.setActiveToolPresentation(planModeTools, planModeMountedTools);
-				} catch (rollbackError) {
-					logger.warn("Failed to restore plan tools after plan exit failure", {
-						error: String(rollbackError),
-					});
-				}
-			}
-			throw error;
-		}
-		this.session.setPlanProposalHandler?.(null);
-		this.planModeEnabled = false;
-		// Suppress cache-miss marker on the next turn: plan exit changes the system
-		// prompt, which predictably invalidates the cache.
-		this.lastAssistantUsage = undefined;
-		this.planModePaused = options?.paused ?? false;
-		this.planModePlanFilePath = undefined;
-		this.#planModePreviousToolPresentation = undefined;
-		if (!options?.deferModelRestore) this.#planModePreviousModelState = undefined;
-		this.#updatePlanModeStatus();
-		const paused = options?.paused ?? false;
-		this.sessionManager.appendModeChange(paused ? "plan_paused" : "none");
-		if (!options?.silent) {
-			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
-		}
+		await this.#modes.exitPlan(options);
 	}
 
 	/**
@@ -4415,43 +4225,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * point them at the second `/plan` toggle that fully exits instead.
 	 */
 	#warnPlanModeBlocks(): void {
-		this.showWarning(
-			this.planModePaused ? "Plan mode is paused — run /plan again to fully exit." : "Exit plan mode first.",
-		);
+		const blocked = this.#modes.canEnter("goal");
+		if (blocked !== true) this.showWarning(blocked);
 	}
 
 	async #enterGoalMode(options: { objective?: string; resume?: boolean; silent?: boolean }): Promise<void> {
-		if (this.goalModeEnabled) {
-			return;
-		}
-		if (this.planModeEnabled || this.planModePaused) {
-			this.#warnPlanModeBlocks();
-			return;
-		}
-		if (this.vibeModeEnabled) {
-			this.showWarning("Exit vibe mode first.");
-			return;
-		}
-		const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
-		const goalTools = [...new Set([...previousTools, "goal"])];
-		this.#goalModePreviousTools = previousTools;
-		this.goalModePaused = false;
-		const state = options.resume
-			? await this.session.goalRuntime.resumeGoal()
-			: await this.session.goalRuntime.createGoal({
-					objective: options.objective ?? "",
-				});
-		await this.session.setActiveToolsByName(goalTools);
-		this.session.setGoalModeState(state);
-		this.goalModeEnabled = true;
-		this.#resetGoalContinuationSuppression();
-		this.#updateGoalModeStatus();
-		if (this.session.isStreaming) {
-			await this.session.sendGoalModeContext({ deliverAs: "steer" });
-		}
-		if (!options.silent) {
-			this.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
-		}
+		await this.#modes.enterGoal(options);
 	}
 
 	async #exitGoalMode(options?: {
@@ -4459,40 +4238,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		paused?: boolean;
 		reason?: "completed" | "paused" | "dropped";
 	}): Promise<void> {
-		const previousTools = this.#goalModePreviousTools;
-		if (this.goalModeEnabled && previousTools) {
-			await this.session.setActiveToolsByName(previousTools);
-		}
-		const currentState = this.session.getGoalModeState();
-		if (options?.reason === "completed") {
-			this.session.setGoalModeState(undefined);
-			this.sessionManager.appendModeChange("none");
-			this.sessionManager.appendCustomEntry("goal-completed", {
-				objective: currentState?.goal?.objective,
-				tokensUsed: currentState?.goal?.tokensUsed,
-				tokenBudget: currentState?.goal?.tokenBudget,
-				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
-			});
-		}
-		this.goalModeEnabled = false;
-		this.goalModePaused = options?.paused ?? false;
-		this.#goalModePreviousTools = undefined;
-		this.#pendingGoalContinuationTurns = 0;
-		this.#previousGoalContinuationActivity = undefined;
-		this.#goalSuppressNextContinuation = false;
-		this.#cancelGoalContinuation();
-		this.#updateGoalModeStatus();
-		if (!options?.silent) {
-			if (options?.reason === "completed") {
-				this.showStatus("Goal mode completed.");
-			} else if (options?.reason === "dropped") {
-				this.showStatus("Goal dropped.");
-			} else if (options?.paused) {
-				this.showStatus("Goal mode paused.");
-			} else {
-				this.showStatus("Goal mode disabled.");
-			}
-		}
+		await this.#modes.exitGoal(options);
 	}
 
 	async #readPlanFile(planFilePath: string): Promise<string | null> {
@@ -4875,7 +4621,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			executionModel?: ResolvedRoleModel;
 		},
 	): Promise<boolean> {
-		const previousPresentation = this.#planModePreviousToolPresentation ?? {
+		const previousPresentation = this.#modes.planModePreviousToolPresentation ?? {
 			enabled: this.session.getEnabledToolNames().filter(name => !isMCPToolName(name)),
 			mounted: this.session.getMountedXdevToolNames().filter(name => !isMCPToolName(name)),
 		};
@@ -5094,7 +4840,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// Prompted /plan invocations fall through to #enterPlanMode below so the
 			// supplied prompt is still submitted as the first plan-mode turn.
 			this.planModePaused = false;
-			this.#planModeHasEntered = false;
+			this.#modes.planModeHasEntered = false;
 			this.#updatePlanModeStatus();
 			this.sessionManager.appendModeChange("none");
 			this.showStatus("Plan mode disabled.");
@@ -5344,7 +5090,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// tool-driven create flips goalModeEnabled via `goal_updated`, and the
 			// eventual goal exit restores this set (dropping the goal tool again).
 			const enabledTools = this.session.getEnabledToolNames();
-			this.#goalModePreviousTools = enabledTools.filter(name => name !== "goal");
+			this.#modes.recordGoalToolBaseline();
 			if (!enabledTools.includes("goal")) {
 				await this.session.setActiveToolsByName([...enabledTools, "goal"]);
 			}
