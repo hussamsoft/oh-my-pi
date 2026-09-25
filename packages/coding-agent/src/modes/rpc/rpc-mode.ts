@@ -58,6 +58,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
 import { VibeModeController } from "../../vibe/mode-controller";
+import { OmpModeController } from "../mode-controller";
 import { ToolCatalogController } from "../../vibe/tool-catalog";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
@@ -772,13 +773,20 @@ type RpcVibeController = Pick<
 >;
 type RpcVibeCommand = Extract<
 	RpcCommand,
-	{ type: "vibe_status" | "vibe_enter" | "vibe_exit" | "vibe_spawn" | "vibe_send" | "vibe_wait" | "vibe_kill" | "vibe_list" }
+	{
+		type:
+			| "vibe_status"
+			| "vibe_enter"
+			| "vibe_exit"
+			| "vibe_spawn"
+			| "vibe_send"
+			| "vibe_wait"
+			| "vibe_kill"
+			| "vibe_list";
+	}
 >;
 
-export async function dispatchRpcVibeCommand(
-	controller: RpcVibeController,
-	command: RpcVibeCommand,
-): Promise<object> {
+export async function dispatchRpcVibeCommand(controller: RpcVibeController, command: RpcVibeCommand): Promise<object> {
 	switch (command.type) {
 		case "vibe_status":
 			return controller.getState();
@@ -790,19 +798,29 @@ export async function dispatchRpcVibeCommand(
 		case "vibe_exit":
 			return controller.exit();
 		case "vibe_spawn":
-			if ((command.cli !== "fast" && command.cli !== "good") || typeof command.prompt !== "string" || !command.prompt.trim()) {
+			if (
+				(command.cli !== "fast" && command.cli !== "good") ||
+				typeof command.prompt !== "string" ||
+				!command.prompt.trim()
+			) {
 				throw new Error("cli must be fast or good and prompt must be non-empty");
 			}
 			return controller.spawn(command);
 		case "vibe_send":
-			if (typeof command.session !== "string" || !command.session.trim() || typeof command.message !== "string" || !command.message.trim()) {
+			if (
+				typeof command.session !== "string" ||
+				!command.session.trim() ||
+				typeof command.message !== "string" ||
+				!command.message.trim()
+			) {
 				throw new Error("session and message must be non-empty strings");
 			}
 			return controller.send(command);
 		case "vibe_wait":
 			if (
 				(command.sessions !== undefined &&
-					(!Array.isArray(command.sessions) || command.sessions.some(id => typeof id !== "string" || !id.trim()))) ||
+					(!Array.isArray(command.sessions) ||
+						command.sessions.some(id => typeof id !== "string" || !id.trim()))) ||
 				(command.timeoutMs !== undefined && (!Number.isFinite(command.timeoutMs) || command.timeoutMs <= 0))
 			) {
 				throw new Error("sessions must contain worker ids and timeoutMs must be positive");
@@ -877,18 +895,34 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
 	const toolCatalog = new ToolCatalogController(session);
-	const vibeToolSession = session.getToolSession();
-	const vibeController = vibeToolSession
+	const toolSession = session.getToolSession();
+	// One owner for plan, goal and loop mode, shared with InteractiveMode. The guard
+	// strings live only in `canEnter`, so the RPC surface reports the same message
+	// the TUI shows rather than a second copy that can drift.
+	const modes = new OmpModeController({
+		session,
+		isVibeEnabled: () => vibeController?.isEnabled ?? false,
+		resolvePlanFilePath: async () => session.getPlanReferencePath() || "local://PLAN.md",
+		applyPlanModeModel: async () => {
+			const resolved = session.resolveRoleModelWithThinking("plan");
+			if (!resolved.model) return;
+			await session.setModelTemporary(resolved.model, resolved.thinkingLevel);
+		},
+		restorePlanPreviousModel: async previous => {
+			await session.setModelTemporary(previous.model, previous.thinkingLevel);
+		},
+		planPreviousModelState: () => undefined,
+		clearPendingPlanModelSwitch: () => {},
+		onStatus: message => output({ type: "notice", level: "info", message, source: "modes" }),
+		onWarning: message => output({ type: "notice", level: "warning", message, source: "modes" }),
+	});
+	const vibeController = toolSession
 		? new VibeModeController({
 				session,
-				toolSession: vibeToolSession,
+				toolSession,
 				subagentEventBus,
 				onState: state => output({ type: "vibe_state", payload: state } satisfies RpcVibeStateFrame),
-				canEnter: () => {
-					if (session.getPlanModeState()?.enabled) return "Exit plan mode first.";
-					if (session.getGoalModeState()?.enabled) return "Exit goal mode first.";
-					return true;
-				},
+				canEnter: () => modes.canEnter("vibe"),
 				dispatchPrompt: async prompt => (await session.prompt(prompt)) === true,
 			})
 		: undefined;
