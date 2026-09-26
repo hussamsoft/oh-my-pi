@@ -301,6 +301,7 @@ export interface RpcSettingEntry {
 	description?: string;
 	credential: boolean;
 	condition?: unknown;
+	ui?: { tab: string; group?: string; label: string; description?: string };
 }
 
 export interface RpcSettingsResult {

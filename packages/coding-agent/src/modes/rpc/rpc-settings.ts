@@ -47,6 +47,14 @@ function project(setting: AnySetting, settings: Settings, display: SettingsDispl
 		// The predicate, never the function: it serializes to `null` on the wire and a host
 		// cannot act on it. Evaluated here, while the row is being built.
 		condition: display?.condition?.(),
+		ui: display?.ui
+			? {
+					tab: display.ui.tab,
+					group: display.ui.group,
+					label: display.ui.label,
+					description: display.ui.description,
+				}
+			: undefined,
 	};
 }
 
