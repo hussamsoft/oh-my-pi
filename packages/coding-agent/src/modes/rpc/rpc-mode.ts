@@ -1347,7 +1347,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * loss is mirrored on stderr and the exit code is nonzero. A dispose
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
-	let unsubscribeSettings: (() => void) | undefined;
 	let settingsUpdateTimeout: NodeJS.Timeout | null = null;
 	const disposeAndExit = async (): Promise<never> => {
 		try {
@@ -1380,7 +1379,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
-		unsubscribeSettings?.();
+		unsubscribeSettings();
 		if (settingsUpdateTimeout) {
 			clearTimeout(settingsUpdateTimeout);
 			settingsUpdateTimeout = null;
@@ -1422,7 +1421,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			},
 		} satisfies RpcSettingsUpdateFrame);
 	};
-	unsubscribeSettings = session.settings.onEffectiveChange(all(), setting => {
+	const unsubscribeSettings = session.settings.onEffectiveChange(all(), setting => {
 		pendingSettingsUpdates.push(setting.id);
 		if (!settingsUpdateTimeout) {
 			settingsUpdateTimeout = setTimeout(flushSettingsUpdate, 100);
