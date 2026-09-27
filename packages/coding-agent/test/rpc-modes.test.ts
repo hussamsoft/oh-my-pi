@@ -98,6 +98,7 @@ function makeSession(initialTools: string[] = ["read", "write"]) {
 		enabledTools: () => enabledTools,
 		planState: () => planState,
 		lastCreateGoalInput: () => lastCreateGoalInput,
+		goalState: () => goalState,
 		goalActionCalls,
 	};
 }
@@ -323,6 +324,25 @@ describe("RPC mode dispatch", () => {
 
 		const described = describeModes(controller.snapshot(), true);
 		expect(described.goal).toMatchObject({ objective: "ship the thing", tokenBudget: undefined });
+	});
+
+	test("snapshot reports no goal once the mode is disabled, despite lingering session state", async () => {
+		const { controller, goalState } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		// `exitGoal` only clears the session goal state on `reason: "completed"`;
+		// a plain disable (no reason) flips the flags and leaves the record
+		// behind. The snapshot must key off the flags, or a disabled mode keeps
+		// advertising an active objective.
+		await applied(controller, setMode("goal"));
+		await applied(controller, setMode("goal"));
+		expect(controller.mode).toBe("none");
+		expect(goalState()).toBeDefined();
+		expect(controller.snapshot().goal).toBeNull();
 	});
 
 	test("describeModes reports loop as null once disabled", async () => {

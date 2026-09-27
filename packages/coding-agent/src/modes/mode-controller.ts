@@ -192,7 +192,14 @@ export class OmpModeController {
 			prewalkArmed: false,
 			fastModeEnabled: false,
 			hideThinking: false,
-			goal: this.#session.getGoalModeState()?.goal ?? null,
+			// Gated on the flags, not the raw session state: `exitGoal` only
+			// clears that state on `reason: "completed"`, so a plain disable
+			// leaves the record behind and an ungated read would advertise an
+			// active objective under mode "none". Paused still counts — the
+			// objective and budget have to survive a pause for the host.
+			goal: this.goalModeEnabled || this.goalModePaused ? (this.#session.getGoalModeState()?.goal ?? null) : null,
+			// Loop needs no such gate: it is runtime state on this controller,
+			// and `disableLoopMode` clears all of it unconditionally.
 			loop: this.loopModeEnabled
 				? {
 						state: this.loopModePaused ? "paused" : "running",
