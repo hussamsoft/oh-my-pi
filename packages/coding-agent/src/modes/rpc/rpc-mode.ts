@@ -2038,6 +2038,32 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				return success(id, "handoff", result ? { savedPath: result.savedPath } : null);
 			}
 
+			// Read-only catalog of agents the host can render in a list cell.
+			// Bundled + user + project + extension-package agents are merged by
+			// `discoverAgents`; session-local model-mention agents are appended.
+			// Hosts must not act on `systemPrompt` (it is intentionally omitted
+			// from the response) and must gate any spawn/execute action on a
+			// separate fork RPC that does not yet exist.
+			case "get_available_agents": {
+				const defs = await session.getSessionAgents();
+				const agents = defs.map(def => ({
+					name: def.name,
+					description: def.description,
+					source: def.source,
+					...(def.filePath ? { filePath: def.filePath } : {}),
+					...(def.tools ? { tools: def.tools } : {}),
+					...(def.spawns ? { spawns: def.spawns } : {}),
+					...(def.model ? { model: def.model } : {}),
+					...(def.thinkingLevel ? { thinkingLevel: def.thinkingLevel } : {}),
+					...(def.autoloadSkills ? { autoloadSkills: def.autoloadSkills } : {}),
+					...(def.advisor !== undefined ? { advisor: def.advisor } : {}),
+					...(def.prewalk !== undefined ? { prewalk: def.prewalk } : {}),
+					...(def.blocking !== undefined ? { blocking: def.blocking } : {}),
+					...(def.readSummarize !== undefined ? { readSummarize: def.readSummarize } : {}),
+				}));
+				return success(id, "get_available_agents", { agents });
+			}
+
 			// =================================================================
 			// Messages
 			// =================================================================

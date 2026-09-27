@@ -12,7 +12,7 @@ import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
-import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentProgress, AgentSource } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type {
@@ -124,6 +124,10 @@ export type RpcCommand =
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
 	| { id?: string; type: "handoff"; customInstructions?: string }
+	// Available agent catalog (bundled + user + project + extension). Read-only;
+	// hosts render a list cell and gate any spawn/execute action on a separate
+	// RPC that the fork does not yet expose.
+	| { id?: string; type: "get_available_agents" }
 
 	// Messages
 	| { id?: string; type: "get_messages" }
@@ -566,6 +570,36 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 	| { id?: string; type: "response"; command: "handoff"; success: true; data: RpcHandoffResult | null }
+	/**
+	 * Available agent catalog — one row per discovered or bundled agent.
+	 * `systemPrompt` is intentionally omitted: hosts only need the
+	 * metadata fields to render a list cell, and prompts are large. Any
+	 * host that wants to spawn one should rely on a separate fork RPC
+	 * (not yet exposed).
+	 */
+	| {
+			id?: string;
+			type: "response";
+			command: "get_available_agents";
+			success: true;
+			data: {
+				agents: Array<{
+					name: string;
+					description: string;
+					source: AgentSource;
+					filePath?: string;
+					tools?: string[];
+					spawns?: string[] | "*";
+					model?: string[];
+					thinkingLevel?: string;
+					autoloadSkills?: string[];
+					advisor?: boolean | string;
+					prewalk?: boolean | string;
+					blocking?: boolean;
+					readSummarize?: boolean;
+				}>;
+			};
+	  }
 
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
