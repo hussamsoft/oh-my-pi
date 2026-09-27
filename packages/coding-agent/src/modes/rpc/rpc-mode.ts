@@ -982,9 +982,28 @@ export async function dispatchRpcGoalAction(
 	session: OmpModeSession,
 	action: "pause" | "resume" | "drop",
 ): Promise<RpcModesResult> {
-	if (action === "pause") await session.goalRuntime.pauseGoal();
-	else if (action === "resume") await session.goalRuntime.resumeGoal();
-	else await session.goalRuntime.dropGoal();
+	if (action === "pause") {
+		// Mirrors interactive-mode `#pauseGoalAction`: flip the goal object
+		// first (the runtime owns the session goal state and the paused
+		// status), then hand the working toolset back and set the derived
+		// flags. `adoptGoalState` alone would report `goalModeEnabled=false`
+		// while leaving the `goal` tool armed and `goalModePreviousTools`
+		// uncaptured — the same desync drop already avoids.
+		await session.goalRuntime.pauseGoal();
+		await controller.exitGoal({ paused: true, reason: "paused", silent: true });
+	} else if (action === "resume") {
+		// Mirrors `#resumeGoalAction`. `enterGoal({ resume })` re-runs
+		// `goalRuntime.resumeGoal()` internally, recaptures the tool baseline,
+		// and re-arms the `goal` tool (pause handed it back), so the runtime
+		// call must not be duplicated here.
+		await controller.enterGoal({ resume: true, silent: true });
+	} else {
+		// `dropGoal` doesn't clear the controller flags or restore the toolset;
+		// `exitGoal` does. `reason: "dropped"` matches the TUI's drop (never
+		// journals, since only `reason: "completed"` does).
+		await session.goalRuntime.dropGoal();
+		await controller.exitGoal({ reason: "dropped", silent: true });
+	}
 	return describeModes(controller.snapshot(), controller.canEnter("plan"));
 }
 

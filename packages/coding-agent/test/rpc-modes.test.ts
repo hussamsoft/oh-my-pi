@@ -33,14 +33,32 @@ function makeSession(initialTools: string[] = ["read", "write"]) {
 			},
 			resumeGoal: async () => {
 				goalActionCalls.push("resume");
-				return { enabled: true };
+				const goal = (goalState as { goal?: unknown } | undefined)?.goal ?? {
+					id: "goal-1",
+					objective: "x",
+					status: "active",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: 0,
+					updatedAt: 0,
+				};
+				const state = { enabled: true, mode: "active", goal: { ...(goal as object), status: "active" } };
+				// Mirrors GoalRuntime.#commitState -> host.setState: the runtime, not
+				// the controller, owns the session goal state on a resume.
+				goalState = state;
+				return state;
 			},
 			pauseGoal: async () => {
 				goalActionCalls.push("pause");
-				return undefined;
+				const goal = (goalState as { goal?: unknown } | undefined)?.goal;
+				if (!goal) return undefined;
+				const state = { enabled: false, mode: "active", goal: { ...(goal as object), status: "paused" } };
+				goalState = state;
+				return state;
 			},
 			dropGoal: async () => {
 				goalActionCalls.push("drop");
+				goalState = undefined;
 				return undefined;
 			},
 		},
@@ -328,10 +346,67 @@ describe("dispatchRpcGoalAction", () => {
 		expect(goalActionCalls).toEqual(["pause", "resume", "drop"]);
 	});
 
-	test("returns the post-action mode snapshot", async () => {
-		const { controller, session } = makeController();
+	test("pause flips the controller flags and hands the working toolset back", async () => {
+		const { controller, session, enabledTools } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		expect(enabledTools()).toContain("goal");
+
 		const result = await dispatchRpcGoalAction(controller, session, "pause");
 
-		expect(result).toMatchObject({ canEnter: true, mode: controller.mode });
+		// Regression: dispatchRpcGoalAction used to call the goal runtime
+		// directly (or only adoptGoalState) without exiting the controller's
+		// goal mode, so goalModeEnabled stayed true, the derived `mode` stayed
+		// "goal", canEnter("goal") stayed blocked, and — the subtler half — the
+		// `goal` tool stayed armed while the client was told the goal was off.
+		expect(controller.goalModeEnabled).toBe(false);
+		expect(controller.goalModePaused).toBe(true);
+		expect(controller.mode).toBe("goal_paused");
+		expect(result.mode).toBe("goal_paused");
+		expect(result.goal).toMatchObject({ status: "paused" });
+		expect(enabledTools()).not.toContain("goal");
+	});
+
+	test("resume re-arms the goal tool and flips the flags back to active", async () => {
+		const { controller, session, enabledTools } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		await dispatchRpcGoalAction(controller, session, "pause");
+		expect(enabledTools()).not.toContain("goal");
+
+		const result = await dispatchRpcGoalAction(controller, session, "resume");
+
+		// Resume has to re-arm the goal tool pause handed back — a bare
+		// goalRuntime.resumeGoal() + adoptGoalState would revive the goal object
+		// while the agent silently lost the ability to call `goal`.
+		expect(controller.goalModeEnabled).toBe(true);
+		expect(controller.goalModePaused).toBe(false);
+		expect(controller.mode).toBe("goal");
+		expect(result.goal).toMatchObject({ status: "active" });
+		expect(enabledTools()).toContain("goal");
+	});
+
+	test("drop clears both flags and the goal, and restores the pre-goal toolset", async () => {
+		const { controller, session, enabledTools } = makeController(["read"]);
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		expect(enabledTools()).toContain("goal");
+
+		const result = await dispatchRpcGoalAction(controller, session, "drop");
+
+		expect(controller.goalModeEnabled).toBe(false);
+		expect(controller.goalModePaused).toBe(false);
+		expect(controller.mode).toBe("none");
+		expect(result.goal).toBeNull();
+		expect(enabledTools()).not.toContain("goal");
 	});
 });
