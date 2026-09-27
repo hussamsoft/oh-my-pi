@@ -26,6 +26,8 @@ import type {
 	VibeWaitResult,
 } from "../../vibe/mode-controller";
 import type { OmpModeName } from "../mode-controller";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
 import type { ToolCatalogEntry } from "../../vibe/tool-catalog";
 
 export type {
@@ -133,7 +135,25 @@ export type RpcCommand =
 
 	// Modes (plan, goal, loop) — driven by the shared OmpModeController
 	| { id?: string; type: "get_modes" }
-	| { id?: string; type: "set_mode"; mode: "plan" | "goal" | "loop"; paused?: boolean }
+	// `objective`/`tokenBudget` apply when entering goal mode (ignored otherwise,
+	// same as OMP's own `enterGoal` defaulting objective to ""). `args` is the
+	// raw `/loop` argument string (e.g. "10m --until 'bun test' fix it") applied
+	// when entering loop mode; parsed server-side by the same `parseLoopArgs`
+	// the TUI uses, so the grammar never has to be duplicated on a host.
+	| {
+			id?: string;
+			type: "set_mode";
+			mode: "plan" | "goal" | "loop";
+			paused?: boolean;
+			objective?: string;
+			tokenBudget?: number;
+			args?: string;
+	  }
+	// Actions on an already-active or paused goal, distinct from the mode
+	// enter/pause/disable cycle `set_mode` drives: these call the goal
+	// runtime's own pause/resume/drop directly, matching `/goal pause`,
+	// `/goal resume`, `/goal drop`.
+	| { id?: string; type: "goal_action"; action: "pause" | "resume" | "drop" }
 
 	// Keybindings — a host reads the merged table and rebinds one action id
 	| { id?: string; type: "get_keybindings" }
@@ -260,6 +280,10 @@ export interface RpcModesResult {
 	loopModeEnabled: boolean;
 	loopModePaused: boolean;
 	planFilePath: string | undefined;
+	/** Rich objective/budget/progress data for the active or paused goal, or `null` when none. */
+	goal: Goal | null;
+	/** Rich limit/condition/prompt data for the active loop, or `null` when disabled. */
+	loop: { state: "running" | "paused"; limit?: LoopLimitRuntime; condition?: LoopConditionConfig; prompt?: string } | null;
 	/** False when the requested mode is already active, so no transition ran. */
 	canEnter: true | false;
 	/** Present only when `canEnter` is false: OMP's own guard message, verbatim. */
@@ -560,6 +584,7 @@ export type RpcResponse =
 	// Modes
 	| { id?: string; type: "response"; command: "get_modes"; success: true; data: RpcModesResult }
 	| { id?: string; type: "response"; command: "set_mode"; success: true; data: RpcSetModeResult }
+	| { id?: string; type: "response"; command: "goal_action"; success: true; data: RpcModesResult }
 
 	// Keybindings, settings, slash commands
 	| { id?: string; type: "response"; command: "get_keybindings"; success: true; data: RpcKeybindingsResult }

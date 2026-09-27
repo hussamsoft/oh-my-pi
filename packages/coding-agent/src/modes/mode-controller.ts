@@ -2,6 +2,7 @@ import { isMCPToolName } from "../tools/builtin-names";
 import { createLoopLimitRuntime, describeLoopLimit, describeLoopLimitRuntime, parseLoopArgs } from "./loop-limit";
 import { describeLoopCondition } from "./loop-condition";
 import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { PlanModeState } from "../plan-mode/state";
 import type { GoalModeState } from "../goals/state";
@@ -30,6 +31,10 @@ export interface OmpModeState {
 	prewalkArmed: boolean;
 	fastModeEnabled: boolean;
 	hideThinking: boolean;
+	/** Rich objective/budget/progress data for the active or paused goal, or `null` when none. */
+	goal: Goal | null;
+	/** Rich limit/condition/prompt data for the active loop, or `null` when disabled. Never persisted across a resume — loop is session-only. */
+	loop: { state: "running" | "paused"; limit?: LoopLimitRuntime; condition?: LoopConditionConfig; prompt?: string } | null;
 }
 
 /** The session surface the transitions need. Kept narrow so the TUI can pass itself. */
@@ -187,6 +192,15 @@ export class OmpModeController {
 			prewalkArmed: false,
 			fastModeEnabled: false,
 			hideThinking: false,
+			goal: this.#session.getGoalModeState()?.goal ?? null,
+			loop: this.loopModeEnabled
+				? {
+						state: this.loopModePaused ? "paused" : "running",
+						limit: this.loopLimit,
+						condition: this.loopCondition,
+						prompt: this.loopPrompt,
+					}
+				: null,
 			...overrides,
 		};
 	}
@@ -346,7 +360,12 @@ export class OmpModeController {
 
 	// ---------------------------------------------------------------- goal
 
-	async enterGoal(options: { objective?: string; resume?: boolean; silent?: boolean }): Promise<boolean> {
+	async enterGoal(options: {
+		objective?: string;
+		tokenBudget?: number;
+		resume?: boolean;
+		silent?: boolean;
+	}): Promise<boolean> {
 		if (this.goalModeEnabled) return false;
 		const blocked = this.canEnter("goal");
 		if (blocked !== true) {
@@ -363,7 +382,10 @@ export class OmpModeController {
 		this.goalModePaused = false;
 		const state = options.resume
 			? await this.#session.goalRuntime.resumeGoal()
-			: await this.#session.goalRuntime.createGoal({ objective: options.objective ?? "" });
+			: await this.#session.goalRuntime.createGoal({
+					objective: options.objective ?? "",
+					tokenBudget: options.tokenBudget,
+				});
 		await this.#session.setActiveToolsByName(goalTools);
 		this.#session.setGoalModeState(state);
 		this.goalModeEnabled = true;

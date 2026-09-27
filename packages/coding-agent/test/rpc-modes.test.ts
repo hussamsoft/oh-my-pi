@@ -1,5 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
+	describeModes,
+	dispatchRpcGoalAction,
 	dispatchRpcModeCommand,
 	nextModeTransition,
 	toSetModeResponse,
@@ -17,14 +19,30 @@ function makeSession(initialTools: string[] = ["read", "write"]) {
 	let mountedTools = [...initialTools];
 	let planState: unknown;
 	let goalState: unknown;
+	let lastCreateGoalInput: { objective: string; tokenBudget?: number } | undefined;
+	const goalActionCalls: string[] = [];
 	const appendModeChange = mock((_mode: string): string => "entry-1");
 
 	const session = {
 		sessionManager: { appendModeChange: appendModeChange as never },
 		isStreaming: false,
 		goalRuntime: {
-			createGoal: async () => ({ enabled: true }),
-			resumeGoal: async () => ({ enabled: true }),
+			createGoal: async (input: { objective: string; tokenBudget?: number }) => {
+				lastCreateGoalInput = input;
+				return { enabled: true, goal: { objective: input.objective, tokenBudget: input.tokenBudget } };
+			},
+			resumeGoal: async () => {
+				goalActionCalls.push("resume");
+				return { enabled: true };
+			},
+			pauseGoal: async () => {
+				goalActionCalls.push("pause");
+				return undefined;
+			},
+			dropGoal: async () => {
+				goalActionCalls.push("drop");
+				return undefined;
+			},
 		},
 		getEnabledToolNames: () => [...enabledTools],
 		getMountedXdevToolNames: () => [...mountedTools],
@@ -61,6 +79,8 @@ function makeSession(initialTools: string[] = ["read", "write"]) {
 		appendModeChange,
 		enabledTools: () => enabledTools,
 		planState: () => planState,
+		lastCreateGoalInput: () => lastCreateGoalInput,
+		goalActionCalls,
 	};
 }
 
@@ -249,5 +269,69 @@ describe("RPC mode dispatch", () => {
 			success: true,
 			data: { mode: "plan", planModeEnabled: true, changed: true, canEnter: true },
 		});
+	});
+
+	test("entering goal with an objective and token budget reaches the goal runtime", async () => {
+		const { controller, lastCreateGoalInput } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+			tokenBudget: 50_000,
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		expect(lastCreateGoalInput()).toEqual({ objective: "ship the thing", tokenBudget: 50_000 });
+	});
+
+	test("entering loop with raw args parses the limit onto the controller", async () => {
+		const { controller } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "loop",
+			args: "5 fix the failing tests",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		expect(controller.loopModeEnabled).toBe(true);
+		expect(controller.loopLimit).toMatchObject({ kind: "iterations", initial: 5, remaining: 5 });
+	});
+
+	test("describeModes surfaces the active goal and loop objects, not just the flags", async () => {
+		const { controller } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		const described = describeModes(controller.snapshot(), true);
+		expect(described.goal).toMatchObject({ objective: "ship the thing", tokenBudget: undefined });
+	});
+
+	test("describeModes reports loop as null once disabled", async () => {
+		const { controller } = makeController();
+		expect(describeModes(controller.snapshot(), true).loop).toBeNull();
+
+		await applied(controller, setMode("loop"));
+		const described = describeModes(controller.snapshot(), true);
+		expect(described.loop).toMatchObject({ state: "running" });
+	});
+});
+
+describe("dispatchRpcGoalAction", () => {
+	test("pause, resume, and drop each reach exactly the matching goal runtime method", async () => {
+		const { controller, session, goalActionCalls } = makeController();
+
+		await dispatchRpcGoalAction(controller, session, "pause");
+		await dispatchRpcGoalAction(controller, session, "resume");
+		await dispatchRpcGoalAction(controller, session, "drop");
+
+		expect(goalActionCalls).toEqual(["pause", "resume", "drop"]);
+	});
+
+	test("returns the post-action mode snapshot", async () => {
+		const { controller, session } = makeController();
+		const result = await dispatchRpcGoalAction(controller, session, "pause");
+
+		expect(result).toMatchObject({ canEnter: true, mode: controller.mode });
 	});
 });

@@ -64,7 +64,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
 import { VibeModeController } from "../../vibe/mode-controller";
-import { OmpModeController, type OmpModeState } from "../mode-controller";
+import { OmpModeController, type OmpModeSession, type OmpModeState } from "../mode-controller";
 import { ToolCatalogController } from "../../vibe/tool-catalog";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
@@ -859,6 +859,8 @@ export function describeModes(state: OmpModeState, guard: true | string): RpcMod
 		loopModeEnabled: state.loopModeEnabled,
 		loopModePaused: state.loopModePaused,
 		planFilePath: state.planFilePath,
+		goal: state.goal,
+		loop: state.loop,
 		canEnter: guard === true,
 		blockedReason: guard === true ? undefined : guard,
 	};
@@ -937,7 +939,7 @@ export async function dispatchRpcModeCommand(
 	// journals, so there is no persisted transition to append here.
 	if (command.mode === "loop") {
 		if (controller.loopModeEnabled) controller.disableLoopMode();
-		else controller.handleLoopCommand();
+		else controller.handleLoopCommand(command.args ?? "");
 		return { state: controller.snapshot(), changed: controller.mode !== before };
 	}
 
@@ -951,7 +953,7 @@ export async function dispatchRpcModeCommand(
 	};
 	const enter = async () => {
 		if (command.mode === "plan") await controller.enterPlan({});
-		else await controller.enterGoal({});
+		else await controller.enterGoal({ objective: command.objective, tokenBudget: command.tokenBudget });
 	};
 
 	if (transition === "enter" || transition === "enter-paused" || transition === "reactivate") {
@@ -965,6 +967,25 @@ export async function dispatchRpcModeCommand(
 	}
 
 	return { state: controller.snapshot(), changed: controller.mode !== before };
+}
+
+/**
+ * Applies a direct pause/resume/drop to the goal runtime, bypassing the
+ * `set_mode` enter/pause/disable cycle: reactivating goal mode through
+ * `set_mode` starts a fresh goal (see the "goal mode pauses and reactivates"
+ * test), which is right for the `/goal` toggle but wrong for a host action
+ * that means "resume the paused goal itself". Exported so it is covered
+ * without standing up a session, matching `dispatchRpcVibeCommand`.
+ */
+export async function dispatchRpcGoalAction(
+	controller: OmpModeController,
+	session: OmpModeSession,
+	action: "pause" | "resume" | "drop",
+): Promise<RpcModesResult> {
+	if (action === "pause") await session.goalRuntime.pauseGoal();
+	else if (action === "resume") await session.goalRuntime.resumeGoal();
+	else await session.goalRuntime.dropGoal();
+	return describeModes(controller.snapshot(), controller.canEnter("plan"));
 }
 
 /**
@@ -2042,6 +2063,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return toSetModeResponse(id, outcome);
 				} catch (err: unknown) {
 					return error(id, "set_mode", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "goal_action": {
+				try {
+					return success(id, "goal_action", await dispatchRpcGoalAction(modes, session, command.action));
+				} catch (err: unknown) {
+					return error(id, "goal_action", err instanceof Error ? err.message : String(err));
 				}
 			}
 
