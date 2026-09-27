@@ -2039,18 +2039,26 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			// Read-only catalog of agents the host can render in a list cell.
-			// Bundled + user + project + extension-package agents are merged by
-			// `discoverAgents`; session-local model-mention agents are appended.
-			// Hosts must not act on `systemPrompt` (it is intentionally omitted
-			// from the response) and must gate any spawn/execute action on a
-			// separate fork RPC that does not yet exist.
+			// Bundled + user + project + extension-package agents come from
+			// `discoverAgents`; session-local model-mention agents are appended
+			// (mirrors structured-subagent.ts:295 so the catalog matches what
+			// the task-spawn path can resolve). Hosts must not act on
+			// `systemPrompt` (it is intentionally omitted from the response)
+			// and must gate any spawn/execute action on a separate fork RPC
+			// that does not yet exist.
 			case "get_available_agents": {
-				const defs = await session.getSessionAgents();
-				const agents = defs.map(def => ({
+				const { discoverAgents } = await import("../../task/discovery.js");
+				type AgentDef = import("../../task/types.js").AgentDefinition;
+				const cwd = session.sessionManager.getCwd();
+				const discovery = await discoverAgents(cwd, undefined, session.effectiveExtensionRoots);
+				const sessionAgents = await session.getSessionAgents();
+				const merged = new Map<string, AgentDef>();
+				for (const def of discovery.agents) merged.set(def.name, def);
+				for (const def of sessionAgents) merged.set(def.name, def);
+				const agents = Array.from(merged.values()).map(def => ({
 					name: def.name,
 					description: def.description,
 					source: def.source,
-					...(def.filePath ? { filePath: def.filePath } : {}),
 					...(def.tools ? { tools: def.tools } : {}),
 					...(def.spawns ? { spawns: def.spawns } : {}),
 					...(def.model ? { model: def.model } : {}),
