@@ -45,13 +45,16 @@ export class RpcSessionSettleWatcher {
 	#recheck = false;
 	readonly #session: RpcSettleSession & Pick<AgentSession, "settleAsyncWork">;
 	readonly #output: (frame: RpcSessionSettledFrame) => void;
+	readonly #beforeSettle: () => Promise<void>;
 
 	constructor(
 		session: RpcSettleSession & Pick<AgentSession, "settleAsyncWork">,
 		output: (frame: RpcSessionSettledFrame) => void,
+		beforeSettle: () => Promise<void> = () => Promise.resolve(),
 	) {
 		this.#session = session;
 		this.#output = output;
+		this.#beforeSettle = beforeSettle;
 	}
 
 	observe(event: AgentSessionEvent): void {
@@ -81,6 +84,11 @@ export class RpcSessionSettleWatcher {
 					await this.#session.settleAsyncWork();
 				}
 			} while (this.#recheck);
+			// Mode bookkeeping that a turn-end event started (goal completion)
+			// awaits the toolset restore, so it has to land before the frame that
+			// tells the host to re-read state -- otherwise a settle-driven
+			// `get_modes` still sees the pre-exit flags.
+			await this.#beforeSettle();
 			if (!this.#active || !isRpcSessionSettled(this.#session)) return;
 			this.#active = false;
 			this.#output({ type: "session_settled" });

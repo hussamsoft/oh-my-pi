@@ -4,6 +4,8 @@ import {
 	dispatchRpcGoalAction,
 	dispatchRpcModeCommand,
 	nextModeTransition,
+	settleRpcGoalCompletion,
+	syncRpcGoalFromEvent,
 	toSetModeResponse,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { OmpModeController } from "@oh-my-pi/pi-coding-agent/modes/mode-controller";
@@ -99,6 +101,9 @@ function makeSession(initialTools: string[] = ["read", "write"]) {
 		planState: () => planState,
 		lastCreateGoalInput: () => lastCreateGoalInput,
 		goalState: () => goalState,
+		setGoalState: (state: unknown) => {
+			goalState = state;
+		},
 		goalActionCalls,
 	};
 }
@@ -428,5 +433,186 @@ describe("dispatchRpcGoalAction", () => {
 		expect(controller.mode).toBe("none");
 		expect(result.goal).toBeNull();
 		expect(enabledTools()).not.toContain("goal");
+	});
+});
+
+/** A completed goal as the runtime parks it mid-turn: enabled off, `exiting`. */
+function exitingGoalState() {
+	return {
+		enabled: false,
+		mode: "exiting",
+		reason: "completed",
+		goal: {
+			id: "goal-1",
+			objective: "ship the thing",
+			status: "complete",
+			tokensUsed: 1200,
+			timeUsedSeconds: 30,
+			createdAt: 0,
+			updatedAt: 1,
+		},
+	} as never;
+}
+
+describe("syncRpcGoalFromEvent", () => {
+	test("an agent-created goal flips the controller flags so get_modes stops lying", async () => {
+		const { controller } = makeController();
+
+		// The goal tool's `create` bypasses set_mode entirely; before this sync
+		// the controller kept reporting mode "none" with no goal while the
+		// session already had an active one.
+		await syncRpcGoalFromEvent(controller, {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "x",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		} as never);
+
+		expect(controller.goalModeEnabled).toBe(true);
+		expect(controller.mode).toBe("goal");
+	});
+
+	test("an agent-dropped goal exits the controller and restores the pre-goal toolset", async () => {
+		const { controller, setGoalState, enabledTools } = makeController(["read"]);
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		expect(enabledTools()).toContain("goal");
+
+		// The goal tool's `drop` path mirrors the runtime: a `goal_updated`
+		// carrying status "dropped" and an undefined session state.
+		setGoalState(undefined);
+		await syncRpcGoalFromEvent(controller, {
+			enabled: false,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "ship the thing",
+				status: "dropped",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		} as never);
+
+		expect(controller.mode).toBe("none");
+		expect(controller.goalModeEnabled).toBe(false);
+		expect(controller.goalModePaused).toBe(false);
+		expect(enabledTools()).toEqual(["read"]);
+	});
+
+	test("a deferred completion leaves the flags alone so the exit can still restore tools", async () => {
+		const { controller, setGoalState, enabledTools } = makeController(["read"]);
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		// Regression: `completeGoalFromTool` already sets `enabled: false`, and a
+		// naive flag sync here would make the later `exitGoal` skip its tool
+		// restore (gated on the flag) while clearing the recorded baseline, so
+		// the `goal` tool would be armed for the rest of the session.
+		setGoalState(exitingGoalState());
+		await syncRpcGoalFromEvent(controller, exitingGoalState());
+
+		expect(controller.goalModeEnabled).toBe(true);
+		expect(controller.goalModePaused).toBe(false);
+		expect(enabledTools()).toContain("goal");
+	});
+
+	test("a budget-limited goal keeps goal mode lit with the budget status", async () => {
+		const { controller, setGoalState } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+
+		const budgetLimited = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "ship the thing",
+				status: "budget-limited",
+				tokenBudget: 1000,
+				tokensUsed: 1000,
+				timeUsedSeconds: 5,
+				createdAt: 0,
+				updatedAt: 1,
+			},
+		} as never;
+		// The runtime commits state before emitting, so the event and the
+		// session agree by the time the controller reconciles.
+		setGoalState(budgetLimited);
+		await syncRpcGoalFromEvent(controller, budgetLimited);
+
+		expect(controller.goalModeEnabled).toBe(true);
+		expect(controller.goalModePaused).toBe(false);
+		expect(describeModes(controller.snapshot(), true).goal).toMatchObject({ status: "budget-limited" });
+	});
+});
+
+describe("settleRpcGoalCompletion", () => {
+	test("the turn end settles a parked completion and journals the exit", async () => {
+		const { controller, session, setGoalState, goalState, enabledTools, appendModeChange } = makeController(["read"]);
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		setGoalState(exitingGoalState());
+		appendModeChange.mockClear();
+
+		await settleRpcGoalCompletion(controller, session);
+
+		expect(controller.mode).toBe("none");
+		expect(controller.goalModeEnabled).toBe(false);
+		expect(goalState()).toBeUndefined();
+		expect(enabledTools()).toEqual(["read"]);
+		// `reason: "completed"` is what writes the resume-reading journal entry.
+		expect(appendModeChange).toHaveBeenCalledWith("none");
+	});
+
+	test("a settled turn with no parked completion is left alone", async () => {
+		const { controller, session, appendModeChange } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		appendModeChange.mockClear();
+
+		await settleRpcGoalCompletion(controller, session);
+
+		expect(controller.goalModeEnabled).toBe(true);
+		expect(appendModeChange).not.toHaveBeenCalled();
+	});
+
+	test("a paused goal surviving a turn end is not settled", async () => {
+		const { controller, session, appendModeChange } = makeController();
+		await applied(controller, {
+			type: "set_mode",
+			mode: "goal",
+			objective: "ship the thing",
+		} as Extract<RpcCommand, { type: "set_mode" }>);
+		await dispatchRpcGoalAction(controller, session, "pause");
+		appendModeChange.mockClear();
+
+		await settleRpcGoalCompletion(controller, session);
+
+		expect(controller.mode).toBe("goal_paused");
+		expect(appendModeChange).not.toHaveBeenCalled();
 	});
 });

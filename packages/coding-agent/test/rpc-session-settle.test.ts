@@ -82,3 +82,36 @@ describe("RpcSessionSettleWatcher", () => {
 		expect(frames).toEqual([{ type: "session_settled" }]);
 	});
 });
+
+describe("RpcSessionSettleWatcher beforeSettle", () => {
+	test("mode bookkeeping a turn-end event queued lands before the settle frame", async () => {
+		const { session } = createSession();
+		const frames: object[] = [];
+		const order: string[] = [];
+		const { promise, resolve } = Promise.withResolvers<void>();
+		const watcher = new RpcSessionSettleWatcher(
+			session,
+			frame => frames.push(frame),
+			async () => {
+				order.push("goal-settle-start");
+				await promise;
+				order.push("goal-settle-done");
+			},
+		);
+
+		watcher.observe(agentStart);
+		watcher.observe(terminalEnd);
+		// One hop short of the two the check consumes: the frame would already
+		// have been emitted without the drain, while the exit still awaited the
+		// toolset restore.
+		await settleLoop();
+		expect(frames).toEqual([]);
+
+		resolve();
+		await settleLoop();
+		// The host refreshes on `session_settled`, so a get_modes that rides
+		// that refresh has to see the post-exit flags.
+		expect(order).toEqual(["goal-settle-start", "goal-settle-done"]);
+		expect(frames).toEqual([{ type: "session_settled" }]);
+	});
+});

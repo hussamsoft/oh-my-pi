@@ -65,6 +65,7 @@ import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
 import { VibeModeController } from "../../vibe/mode-controller";
 import { OmpModeController, type OmpModeSession, type OmpModeState } from "../mode-controller";
+import type { GoalModeState } from "../../goals/state";
 import { ToolCatalogController } from "../../vibe/tool-catalog";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
@@ -1008,6 +1009,56 @@ export async function dispatchRpcGoalAction(
 }
 
 /**
+ * Reconciles the mode controller with a `goal_updated` the agent caused itself,
+ * bypassing `set_mode`/`goal_action`: the goal tool's own `create`/`drop`/
+ * `complete`, and the runtime's budget-limit transition. Without this the
+ * controller keeps reporting an active goal after the agent finished one, so
+ * `get_modes` contradicts the session until the host acts.
+ *
+ * Mirrors the TUI's `#handleGoalSessionEvent`. Completion is deliberately not
+ * handled here: the runtime parks the state at `mode: "exiting"` so the goal
+ * tool can return its report first, and the exit belongs at turn end -- see
+ * {@link settleRpcGoalCompletion}.
+ *
+ * Exported so it is covered without standing up a session.
+ */
+export async function syncRpcGoalFromEvent(
+	controller: OmpModeController,
+	state: GoalModeState | undefined,
+): Promise<void> {
+	if (!state) {
+		if (controller.goalModeEnabled || controller.goalModePaused) {
+			await controller.exitGoal({ reason: "dropped", silent: true });
+		}
+		return;
+	}
+	// Deferred completion: the runtime already flipped `enabled` off, but the
+	// exit must not run yet -- the goal tool still owes the agent its report,
+	// and `exitGoal` only restores the toolset while `goalModeEnabled` is
+	// true. Syncing the flag here would strand the `goal` tool for good.
+	if (state.mode === "exiting") return;
+	// Drop first, while `goalModeEnabled` is still true, so the exit can
+	// restore the pre-goal toolset.
+	if (state.goal.status === "dropped") {
+		await controller.exitGoal({ reason: "dropped", silent: true });
+		return;
+	}
+	controller.goalModeEnabled = state.enabled;
+	controller.goalModePaused = !state.enabled && state.goal.status === "paused";
+}
+
+/**
+ * Ends goal mode when a turn settles a goal the agent completed mid-turn. The
+ * runtime defers this by parking the state at `mode: "exiting"`.
+ *
+ * Exported so it is covered without standing up a session.
+ */
+export async function settleRpcGoalCompletion(controller: OmpModeController, session: OmpModeSession): Promise<void> {
+	if (session.getGoalModeState()?.mode !== "exiting") return;
+	await controller.exitGoal({ reason: "completed", silent: true });
+}
+
+/**
  * Maps a dispatch outcome onto the wire response. A blocked transition is a
  * failure carrying OMP's own message and a machine-readable `mode_conflict`
  * code, so a host can tell "the agent is already in another mode" from a real
@@ -1083,7 +1134,19 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 	const promptResults = new RpcPromptResults(session, output);
 	const sessionEvents = new RpcSessionEventForwarder(output);
-	const settleWatcher = new RpcSessionSettleWatcher(session, output);
+	// Goal reconciliation awaits the session's toolset restore, so the events
+	// that trigger it have to apply in emission order -- two `goal_updated`s
+	// in quick succession would otherwise interleave, and an older exit could
+	// land after a newer enter. `settleWatcher` drains this chain before
+	// `session_settled`, so a host that refreshes on settle never reads
+	// pre-exit flags.
+	let goalSyncTail: Promise<void> = Promise.resolve();
+	const queueGoalSync = (task: () => Promise<void>): void => {
+		goalSyncTail = goalSyncTail.then(task).catch(error => {
+			logger.error("RPC goal resync failed", { error: String(error) });
+		});
+	};
+	const settleWatcher = new RpcSessionSettleWatcher(session, output, () => goalSyncTail);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1346,6 +1409,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		sessionEvents.forward(event);
 		promptResults.observe(event);
 		settleWatcher.observe(event);
+		// The goal tool mutates goal state from inside the turn, so the mode
+		// controller's flags only stay truthful if the events it emits are read
+		// back. Forward first: the exit below re-emits its own events.
+		if (event.type === "goal_updated") {
+			const state = event.state;
+			queueGoalSync(() => syncRpcGoalFromEvent(modes, state));
+		} else if (event.type === "agent_end") {
+			queueGoalSync(() => settleRpcGoalCompletion(modes, session));
+		}
 	});
 
 	// Discriminates a store failure from any other dispose rejection below.
