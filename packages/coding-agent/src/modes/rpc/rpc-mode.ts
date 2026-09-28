@@ -1982,8 +1982,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "bash": {
-				const result = await session.executeBash(command.command);
+				// The TUI's `!!` prefix already reaches the session layer as
+				// options.excludeFromContext; the RPC just never carried it. A host
+				// driving the same command must be able to express the same arm.
+				const result = await session.executeBash(command.command, undefined, {
+					excludeFromContext: command.excludeFromContext === true,
+				});
 				return success(id, "bash", result);
+			}
+
+			case "python": {
+				// `$` / `$$` in the TUI. Added for parity with bash.
+				const result = await session.executePython(command.code, undefined, {
+					excludeFromContext: command.excludeFromContext === true,
+				});
+				return success(id, "python", result);
 			}
 
 			case "abort_bash": {
