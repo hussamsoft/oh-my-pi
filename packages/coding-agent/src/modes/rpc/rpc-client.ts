@@ -11,6 +11,7 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
+import type { PythonResult } from "../../eval/py/executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
@@ -964,6 +965,16 @@ export class RpcClient {
 	 */
 	async bash(command: string): Promise<BashResult> {
 		const response = await this.#send({ type: "bash", command });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Execute Python in the shared kernel.
+	 *
+	 * The mirror of {@link bash}: same shape, same `excludeFromContext` arm.
+	 */
+	async python(code: string, excludeFromContext = false): Promise<PythonResult> {
+		const response = await this.#send({ type: "python", code, excludeFromContext });
 		return this.#getData(response);
 	}
 
