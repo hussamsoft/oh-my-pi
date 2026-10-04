@@ -1,0 +1,26 @@
+fix(rpc): get_available_agents must merge discoverAgents with session-local agents
+
+Two verified defects in 0c9624e2:
+
+1. The handler returned only `session.getSessionAgents()` -- which is
+   `modelMentions.sessionAgents()`, i.e. session-local agents pinned to
+   user-tagged models (agent-session.ts:8269) -- so the catalog was `[]`
+   for anyone who hasn't tagged models and the panel was permanently empty.
+   Its own comment claimed discoverAgents was merged in; no such call
+   existed.
+
+Fix: call `discoverAgents(cwd, undefined, session.effectiveExtensionRoots)`
+to get bundled + user + project + extension-package agents, then append
+`session.getSessionAgents()` for the session-local model-mention
+overrides. This mirrors the merge the task-spawn path already does at
+structured-subagent.ts:295 so the catalog matches what `/task` can
+actually resolve.
+
+2. `filePath` was in the response payload. This is the same host-path
+leak removed in commit 9d255997f for the omp.session.switch wire -- the
+on-disk location of user/project agent definitions is a host filesystem
+detail and must not travel over the wire. Dropped.
+
+The dynamic import (`await import("../../task/discovery.js")`) keeps the
+existing module graph's init cost unchanged for hosts that never call
+this command.
